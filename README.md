@@ -1,5 +1,6 @@
 # Electricity_forecasting
 ## cau truc thu muc 
+
 electricity_forecast_system/
 ├─ README.md                         # mô tả dự án + cách chạy
 ├─ requirements.txt                  # thư viện cần cài
@@ -35,3 +36,21 @@ electricity_forecast_system/
    ├─ forecasts/                     # kết quả dự báo (csv) theo từng lần chạy
    ├─ reports/                       # metrics, log tóm tắt (json/csv)
    └─ figures/                       # biểu đồ xuất ra để đưa vào báo cáo
+
+
+
+
+
+
+--Luồng hệ thống
+user upload CSV
+        ↓
+preprocess.py
+        ↓
+features.py
+        ↓
+model.pkl (XGBoost)
+        ↓
+forecast.py
+        ↓
+dashboard hiển thị dự báo
