@@ -30,6 +30,7 @@ if __name__ == "__main__":
 
     print(fc.head())
     os.makedirs(os.path.join("outputs", "forecasts"), exist_ok=True)
-    out_path = os.path.join("outputs", "forecasts", "test_forecast.csv")
+
+    out_path = os.path.join("outputs", "forecasts", "forecast_result.csv")
     fc.to_csv(out_path, index=False)
     print("Saved:", out_path)
