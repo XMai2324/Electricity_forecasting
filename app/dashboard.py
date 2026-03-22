@@ -24,7 +24,7 @@ os.makedirs(os.path.join("uploads", "raw"), exist_ok=True)
 os.makedirs(os.path.join("outputs", "forecasts"), exist_ok=True)
 
 # ===================== SIDEBAR =====================
-st.sidebar.header("Cấu hình")
+st.sidebar.header("SETTING")
 st.sidebar.caption("Upload file data")
 
 uploaded = st.sidebar.file_uploader("Upload file CSV", type=["csv"])
@@ -44,33 +44,41 @@ bar_label_mode = "Trong cột"
 #===================== LOAD DATA =====================
 df = None
 save_path = None
+current_raw_path = None
 
-# Load PJME.csv mặc định
-default_file = "D:\ĐACN\Electricity_forecasting\data\sample\PJME_hourly.csv"
+# Load file mặc định: KHÔNG preprocess
+default_file = r"D:\ĐACN\Electricity_forecasting\data\sample\PJME_hourly.csv"
 if os.path.exists(default_file):
-    df = preprocess_csv(default_file, TIME_COL, TARGET_COL)
+    current_raw_path = default_file
+    raw_default_df = pd.read_csv(default_file)
+
+    raw_default_df[TIME_COL] = pd.to_datetime(raw_default_df[TIME_COL], errors="coerce")
+    raw_default_df = raw_default_df.dropna(subset=[TIME_COL])
+    raw_default_df = raw_default_df.sort_values(TIME_COL)
+
+    df = raw_default_df.set_index(TIME_COL).copy()
     st.sidebar.success(f"✓ Default file loaded: {default_file}")
 
 # Upload file khác sẽ ghi đè
 if uploaded:
-    # Lưu file raw vào uploads/raw
     raw_path = os.path.join("uploads", "raw", uploaded.name)
     os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+
     with open(raw_path, "wb") as f:
         f.write(uploaded.getbuffer())
 
-    # Làm sạch data
+    current_raw_path = raw_path
+
+    # Chỉ file upload mới preprocess
     df = preprocess_csv(raw_path, TIME_COL, TARGET_COL)
+
     if df is not None:
-        # Lưu file sạch vào uploads/processed
         processed_path = os.path.join("uploads", "processed", uploaded.name)
         os.makedirs(os.path.dirname(processed_path), exist_ok=True)
         df.to_csv(processed_path)
-        st.sidebar.success(f"✓ Default processed_file loaded: {uploaded.name}")
+        st.sidebar.success(f"✓ Uploaded file processed: {uploaded.name}")
     else:
         st.sidebar.error("File upload không hợp lệ hoặc không có dữ liệu. Vẫn dùng file mặc định.")
-
-
 
 # ===================== TABS =====================
 tab_eda, tab_forecast = st.tabs(["📊 EDA", "🔮 Forecast"])
@@ -78,14 +86,32 @@ tab_eda, tab_forecast = st.tabs(["📊 EDA", "🔮 Forecast"])
 # ===================== TAB EDA (để sẵn, làm sau) =====================
 with tab_eda:
     st.subheader("Exploratory Data Analysis (EDA)")
-    if df is not None and show_raw:
-        st.dataframe(df.head(30), use_container_width=True)
 
     if df is None:
         st.warning("Choose a file.")
-        st.stop()   
+        st.stop()
 
+    if current_raw_path is None:
+        st.warning("Raw file not found.")
+        st.stop()
 
+    raw_df = pd.read_csv(current_raw_path)
+
+    st.write("Raw rows:", len(raw_df))
+    st.write("Rows used in analysis:", len(df))
+
+    raw_df[TIME_COL] = pd.to_datetime(raw_df[TIME_COL], errors="coerce")
+    raw_df = raw_df.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
+
+    full_range = pd.date_range(
+        start=raw_df[TIME_COL].min(),
+        end=raw_df[TIME_COL].max(),
+        freq="H"
+    )
+
+    st.write("Expected hourly rows:", len(full_range))
+    st.write("Missing timestamps:", len(full_range) - len(raw_df))
+    st.write("Duplicated timestamps:", raw_df[TIME_COL].duplicated().sum())
 
     st.markdown("### Basic information about the dataset")
     st.markdown(f"""
@@ -94,19 +120,16 @@ with tab_eda:
             <td style="padding: 10px; text-align: center;"><strong>Number of Rows</strong><br>{len(df):,}</td>
             <td style="padding: 10px; text-align: center;"><strong>Start</strong><br>{str(df.index.min())}</td>
             <td style="padding: 10px; text-align: center;"><strong>End</strong><br>{str(df.index.max())}</td>
-            <td style="padding: 10px; text-align: center;"><strong>Target Column</strong><br>{TARGET_COL}</td>     
+            <td style="padding: 10px; text-align: center;"><strong>Target Column</strong><br>{TARGET_COL}</td>
         </tr>
-    </table>           
+    </table>
     """, unsafe_allow_html=True)
-
-                
 
     if show_raw:
         with st.expander("Show raw data (first 30 rows)", expanded=False):
-            st.dataframe(df.head(30), use_container_width=True)
+            st.dataframe(raw_df.head(30), use_container_width=True)
 
-
-
+#==============================================================================
 
 
     st.markdown("### Electricity Consumption Trend")
@@ -492,14 +515,14 @@ with tab_forecast:
 
     left, right = st.columns([1.2, 1])
     with left:
-        st.write("**Nhận xét tổng quan**")
+        st.write("**Summary Insights**")
         st.write(
             f"""
-- Highest forecast day: {max_day} (Average: {daily.max():,.2f} MW)
-- Lowest forecast day: {min_day} (Average: {daily.min():,.2f} MW)
-- Highest peak hour: {max_hour}:00 (Average: {hourly.max():,.2f} MW)
-- Lowest peak hour: {min_hour}:00 (Average: {hourly.min():,.2f} MW)
-            """
+            - Highest forecast day: {max_day} (Average: {daily.max():,.2f} MW)
+            - Lowest forecast day: {min_day} (Average: {daily.min():,.2f} MW)
+            - Highest peak hour: {max_hour}:00 (Average: {hourly.max():,.2f} MW)
+            - Lowest peak hour: {min_hour}:00 (Average: {hourly.min():,.2f} MW)
+        """
         )
 
     with right:

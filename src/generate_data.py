@@ -7,9 +7,9 @@ def generate_electricity_data(output_file, years=5):
     Generate dữ liệu tiêu thụ điện Hà Nội giả lập 5 năm gần nhất.
     Pattern dựa trên PJME nhưng điều chỉnh cho Hà Nội.
     """
-    # Tạo dải thời gian 5 năm gần nhất (2021-2025)
-    start_date = pd.Timestamp('2021-01-01')
-    end_date = pd.Timestamp('2025-12-31 23:00:00')
+    # Tạo dải thời gian 5 năm gần nhất (2018-2022)
+    start_date = pd.Timestamp('2018-01-01')
+    end_date = pd.Timestamp('2022-12-31 23:00:00')
     date_range = pd.date_range(start=start_date, end=end_date, freq='H')
     
     # Tạo base consumption với seasonality
@@ -66,5 +66,5 @@ def generate_electricity_data(output_file, years=5):
     return df
 
 if __name__ == "__main__":
-    output_file = "uploads/raw/saigon_electricity.csv"
+    output_file = "uploads/raw/covid_electricity.csv"
     generate_electricity_data(output_file, years=5)

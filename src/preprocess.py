@@ -21,6 +21,8 @@ def preprocess_csv(
     # Chuyển cột thời gian thành datetime
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[time_col])
+
+    # Loại bỏ trùng lặp: giữ lại bản ghi cuối cùng nếu có nhiều bản ghi cùng thời điểm
     df = df.sort_values(time_col).drop_duplicates(subset=[time_col], keep="last")
 
     # Chuyển target thành numeric
