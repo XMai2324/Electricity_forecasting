@@ -441,7 +441,7 @@ with tab_forecast:
 
     # ===================== FORECAST =====================
     with st.spinner("Running forecast..."):
-        fc = forecast_by_date(
+        fc, X_future, feature_names  = forecast_by_date(
             df=df,
             time_col=TIME_COL,
             target_col=TARGET_COL,
