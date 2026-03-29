@@ -66,5 +66,5 @@ def generate_electricity_data(output_file, years=5):
     return df
 
 if __name__ == "__main__":
-    output_file = "uploads/raw/covid_electricity.csv"
+    output_file = "uploads/raw/DaNang_electricity.csv"
     generate_electricity_data(output_file, years=5)

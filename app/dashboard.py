@@ -1,14 +1,26 @@
 import matplotlib.pyplot as plt
 import sys
 import os
-sys.path.append(os.path.abspath("src"))
+import json
+import joblib
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+SRC_DIR = ROOT_DIR / "src"
+
+sys.path.append(str(SRC_DIR))
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 import plotly.express as px
+import shap
+
+from sklearn.ensemble import IsolationForest
 
 from preprocess import preprocess_csv
 from forecast import forecast_by_date
+from features import add_analysis_features, build_feature_row
 
 # ===================== PAGE CONFIG =====================
 st.set_page_config(page_title="Electricity Forecast XGBoost", layout="wide")
@@ -17,64 +29,520 @@ st.title("Electricity Analysis & Forecasting System")
 TIME_COL = "Datetime"
 TARGET_COL = "PJME_MW"
 
-MODEL_PATH = os.path.join("artifacts", "model.pkl")
-CFG_PATH = os.path.join("artifacts", "feature_config.json")
+MODEL_PATH = ROOT_DIR / "artifacts" / "model.pkl"
+CFG_PATH = ROOT_DIR / "artifacts" / "feature_config.json"
+DEFAULT_FILE = ROOT_DIR / "data" / "sample" / "PJME_hourly.csv"
 
-os.makedirs(os.path.join("uploads", "raw"), exist_ok=True)
-os.makedirs(os.path.join("outputs", "forecasts"), exist_ok=True)
+UPLOAD_RAW_DIR = ROOT_DIR / "uploads" / "raw"
+UPLOAD_PROCESSED_DIR = ROOT_DIR / "uploads" / "processed"
+OUTPUT_FORECAST_DIR = ROOT_DIR / "outputs" / "forecasts"
+
+UPLOAD_RAW_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+
+SEASON_ORDER = ["Spring", "Summer", "Autumn", "Winter"]
+
+# ===================== SESSION STATE =====================
+if "forecast_result" not in st.session_state:
+    st.session_state.forecast_result = None
+if "forecast_start_date" not in st.session_state:
+    st.session_state.forecast_start_date = None
+if "forecast_end_date" not in st.session_state:
+    st.session_state.forecast_end_date = None
+if "forecast_source_signature" not in st.session_state:
+    st.session_state.forecast_source_signature = None
+if "selected_forecast_idx" not in st.session_state:
+    st.session_state.selected_forecast_idx = 0
+
+
+# ===================== INSIGHT HELPERS =====================
+def show_ai_insight(title: str, insights: list[str]) -> None:
+    st.markdown(f"#### 🤖 {title}")
+    for text in insights:
+        st.write(f"- {text}")
+
+
+def generate_trend_insights(series: pd.Series) -> list[str]:
+    s = series.dropna()
+    if s.empty:
+        return ["Chưa đủ dữ liệu để tạo insight."]
+
+    overall_avg = s.mean()
+    peak_time = s.idxmax()
+    low_time = s.idxmin()
+    peak_value = s.max()
+    low_value = s.min()
+
+    first_avg = s.head(min(24 * 30, len(s))).mean()
+    last_avg = s.tail(min(24 * 30, len(s))).mean()
+
+    if first_avg != 0:
+        pct_change = (last_avg - first_avg) / first_avg * 100
+    else:
+        pct_change = 0
+
+    if pct_change > 5:
+        trend_text = "xu hướng tăng"
+    elif pct_change < -5:
+        trend_text = "xu hướng giảm"
+    else:
+        trend_text = "xu hướng tương đối ổn định"
+
+    return [
+        f"Mức tiêu thụ điện nhìn chung có {trend_text} theo thời gian.",
+        f"Giá trị trung bình toàn bộ chuỗi đạt khoảng {overall_avg:,.2f} MW.",
+        f"Điểm cao nhất xuất hiện vào {peak_time} với khoảng {peak_value:,.2f} MW.",
+        f"Điểm thấp nhất xuất hiện vào {low_time} với khoảng {low_value:,.2f} MW.",
+    ]
+
+
+def generate_hourly_insights(hourly_mean: pd.Series) -> list[str]:
+    peak_hour = int(hourly_mean.idxmax())
+    low_hour = int(hourly_mean.idxmin())
+    peak_value = float(hourly_mean.max())
+    low_value = float(hourly_mean.min())
+
+    insights = [
+        f"Khung giờ dùng điện cao nhất trung bình là {peak_hour}:00 với khoảng {peak_value:,.2f} MW.",
+        f"Khung giờ dùng điện thấp nhất trung bình là {low_hour}:00 với khoảng {low_value:,.2f} MW.",
+    ]
+
+    if 17 <= peak_hour <= 21:
+        insights.append("Nhu cầu điện tập trung mạnh vào buổi tối, phù hợp với thời điểm sinh hoạt cao.")
+    elif 9 <= peak_hour <= 16:
+        insights.append("Nhu cầu điện cao tập trung vào giờ làm việc ban ngày.")
+    else:
+        insights.append("Đỉnh tải xuất hiện ở khung giờ ít phổ biến hơn, nên xem thêm theo từng ngày cụ thể.")
+
+    if low_value > 0 and peak_value / low_value >= 1.3:
+        insights.append("Chênh lệch giữa giờ cao điểm và thấp điểm khá rõ, cho thấy phụ tải thay đổi mạnh trong ngày.")
+
+    return insights
+
+
+def generate_selected_day_insights(day_df: pd.DataFrame, target_col: str, selected_date) -> list[str]:
+    valid = day_df[target_col].dropna()
+    if valid.empty:
+        return [f"Không có dữ liệu hợp lệ để phân tích ngày {selected_date}."]
+
+    avg_day = valid.mean()
+    max_time = valid.idxmax()
+    min_time = valid.idxmin()
+    max_val = valid.max()
+    min_val = valid.min()
+
+    return [
+        f"Trong ngày {selected_date}, mức tiêu thụ trung bình đạt khoảng {avg_day:,.2f} MW.",
+        f"Đỉnh trong ngày rơi vào {max_time.hour}:00 với khoảng {max_val:,.2f} MW.",
+        f"Mức thấp nhất trong ngày rơi vào {min_time.hour}:00 với khoảng {min_val:,.2f} MW.",
+    ]
+
+
+def generate_monthly_insights(monthly_year_df: pd.DataFrame, target_col: str) -> list[str]:
+    max_row = monthly_year_df.loc[monthly_year_df[target_col].idxmax()]
+    min_row = monthly_year_df.loc[monthly_year_df[target_col].idxmin()]
+
+    return [
+        f"Tháng có mức tiêu thụ trung bình cao nhất là {int(max_row['month'])}/{int(max_row['year'])} với khoảng {max_row[target_col]:,.2f} MW.",
+        f"Tháng có mức tiêu thụ trung bình thấp nhất là {int(min_row['month'])}/{int(min_row['year'])} với khoảng {min_row[target_col]:,.2f} MW.",
+        "Sự khác biệt giữa các tháng cho thấy dữ liệu có tính mùa vụ khá rõ.",
+    ]
+
+
+def generate_season_insights(season_month_df: pd.DataFrame, target_col: str) -> list[str]:
+    if season_month_df.empty:
+        return ["Chưa đủ dữ liệu để phân tích theo mùa."]
+
+    max_row = season_month_df.loc[season_month_df[target_col].idxmax()]
+    min_row = season_month_df.loc[season_month_df[target_col].idxmin()]
+
+    return [
+        f"Giai đoạn theo mùa cao nhất nằm ở {max_row['season']} - tháng {int(max_row['month'])} với khoảng {max_row[target_col]:,.2f} MW.",
+        f"Giai đoạn thấp nhất nằm ở {min_row['season']} - tháng {int(min_row['month'])} với khoảng {min_row[target_col]:,.2f} MW.",
+        "Biểu đồ cho thấy nhu cầu điện thay đổi theo mùa, thường chịu ảnh hưởng của thời tiết và thói quen sử dụng điện.",
+    ]
+
+
+def generate_day_type_insights(day_type_mean: pd.Series) -> list[str]:
+    insights = []
+
+    if "Weekday" in day_type_mean.index and "Weekend" in day_type_mean.index:
+        if day_type_mean["Weekday"] > day_type_mean["Weekend"]:
+            insights.append("Ngày thường có mức tiêu thụ cao hơn cuối tuần, phản ánh hoạt động làm việc và sản xuất.")
+        else:
+            insights.append("Cuối tuần không thấp hơn ngày thường, cho thấy đặc điểm sử dụng điện của khu vực khá đặc biệt.")
+
+    if "Holiday" in day_type_mean.index:
+        insights.append(f"Ngày lễ có mức tiêu thụ trung bình khoảng {day_type_mean['Holiday']:,.2f} MW.")
+
+    return insights if insights else ["Chưa đủ dữ liệu để tạo insight cho loại ngày."]
+
+
+def generate_forecast_insights(fc: pd.DataFrame) -> list[str]:
+    avg_value = float(fc["yhat"].mean())
+    max_row = fc.loc[fc["yhat"].idxmax()]
+    min_row = fc.loc[fc["yhat"].idxmin()]
+
+    daily = fc.groupby(fc["Datetime"].dt.date)["yhat"].mean()
+    hourly = fc.groupby(fc["Datetime"].dt.hour)["yhat"].mean()
+
+    insights = [
+        f"Giai đoạn dự báo có mức tiêu thụ trung bình khoảng {avg_value:,.2f} MW.",
+        f"Điểm dự báo cao nhất xuất hiện vào {max_row['Datetime']} với khoảng {max_row['yhat']:,.2f} MW.",
+        f"Điểm dự báo thấp nhất xuất hiện vào {min_row['Datetime']} với khoảng {min_row['yhat']:,.2f} MW.",
+        f"Ngày có mức trung bình cao nhất là {daily.idxmax()}, còn ngày thấp nhất là {daily.idxmin()}.",
+        f"Khung giờ dự báo cao nhất là {int(hourly.idxmax())}:00, khung giờ thấp nhất là {int(hourly.idxmin())}:00.",
+    ]
+
+    if max_row["yhat"] > avg_value * 1.1:
+        insights.append("Có thời điểm phụ tải vượt khá xa mức trung bình, nên chú ý khi theo dõi hoặc điều phối công suất.")
+
+    return insights
+
+
+
+# ===================== SIMPLE SHAP HELPERS =====================
+FEATURE_LABELS = {
+    "hour": "Giờ trong ngày",
+    "dayofweek": "Thứ trong tuần",
+    "day": "Ngày trong tháng",
+    "month": "Tháng",
+    "year": "Năm",
+    "weekofyear": "Tuần trong năm",
+    "is_weekend": "Cuối tuần",
+    "hour_sin": "Chu kỳ giờ sin",
+    "hour_cos": "Chu kỳ giờ cos",
+    "dow_sin": "Chu kỳ thứ sin",
+    "dow_cos": "Chu kỳ thứ cos",
+}
+
+
+def get_feature_names_from_cfg(cfg: dict) -> list[str]:
+    for key in ["feature_names", "features", "selected_features", "model_features"]:
+        value = cfg.get(key)
+        if isinstance(value, list) and len(value) > 0:
+            return value
+    raise ValueError("Không tìm thấy danh sách feature trong feature_config.json")
+
+
+@st.cache_resource(show_spinner=False)
+def load_model_and_feature_names(model_path, feature_config_path):
+    model = joblib.load(model_path)
+    with open(feature_config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    feature_names = get_feature_names_from_cfg(cfg)
+    return model, feature_names
+
+
+def human_feature_name(name: str) -> str:
+    if name.startswith("lag_"):
+        step = name.split("_")[1]
+        return f"Nhu cầu trễ {step} giờ"
+    if name.startswith("roll_mean_"):
+        step = name.split("_")[2]
+        return f"Trung bình trượt {step} giờ"
+    if name.startswith("roll_std_"):
+        step = name.split("_")[2]
+        return f"Độ lệch chuẩn trượt {step} giờ"
+    return FEATURE_LABELS.get(name, name)
+
+
+def format_feature_value(v):
+    if pd.isna(v):
+        return "NaN"
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        if float(v).is_integer():
+            return str(int(v))
+        return f"{float(v):,.2f}"
+    return str(v)
+
+
+def build_forecast_feature_matrix(history_df, forecast_df, target_col, feature_names):
+    history = history_df[target_col].dropna().astype(float).copy()
+    rows = []
+
+    for ts, pred in forecast_df[["Datetime", "yhat"]].itertuples(index=False, name=None):
+        ts = pd.Timestamp(ts)
+        row = build_feature_row(ts, history, feature_names)
+        rows.append({"Datetime": ts, **row})
+        history.loc[ts] = float(pred)
+
+    feature_frame = pd.DataFrame(rows).sort_values("Datetime").reset_index(drop=True)
+    X_future = feature_frame[feature_names].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return feature_frame, X_future
+
+
+def make_shap_explainer(model, X_background):
+    try:
+        return shap.TreeExplainer(model)
+    except Exception:
+        return shap.Explainer(model, X_background)
+
+
+def explain_single_prediction_simple(shap_row, feature_row, pred_value):
+    base_value = float(np.array(shap_row.base_values).reshape(-1)[0])
+
+    impacts = pd.DataFrame({
+        "feature": feature_row.index,
+        "feature_name": [human_feature_name(col) for col in feature_row.index],
+        "feature_value": [format_feature_value(v) for v in feature_row.values],
+        "shap_value": shap_row.values
+    })
+
+    positive_df = impacts[impacts["shap_value"] > 0].sort_values("shap_value", ascending=False).head(3)
+    negative_df = impacts[impacts["shap_value"] < 0].sort_values("shap_value", ascending=True).head(3)
+
+    top_abs = impacts.copy()
+    top_abs["abs_value"] = top_abs["shap_value"].abs()
+    top_abs = top_abs.sort_values("abs_value", ascending=False).head(6)
+
+    summary_parts = []
+
+    if not positive_df.empty:
+        inc_names = ", ".join(positive_df["feature_name"].tolist()[:2])
+        summary_parts.append(f"các yếu tố làm tăng dự báo mạnh nhất là {inc_names}")
+
+    if not negative_df.empty:
+        dec_names = ", ".join(negative_df["feature_name"].tolist()[:2])
+        summary_parts.append(f"các yếu tố làm giảm dự báo mạnh nhất là {dec_names}")
+
+    if summary_parts:
+        summary_text = (
+            f"Tại thời điểm này, mô hình có giá trị gốc khoảng {base_value:,.2f} MW. "
+            + ", đồng thời ".join(summary_parts)
+            + f". Sau khi cộng trừ các tác động, giá trị dự báo cuối cùng là {pred_value:,.2f} MW."
+        )
+    else:
+        summary_text = (
+            f"Tại thời điểm này, mô hình có giá trị gốc khoảng {base_value:,.2f} MW "
+            f"và dự báo cuối cùng là {pred_value:,.2f} MW."
+        )
+
+    return base_value, positive_df, negative_df, top_abs, summary_text
+
+
+def plot_simple_shap_contributions(top_abs_df):
+    plot_df = top_abs_df.copy().sort_values("shap_value")
+    labels = [
+        f"{row.feature_name}\n({row.feature_value})"
+        for _, row in plot_df.iterrows()
+    ]
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    bars = ax.barh(labels, plot_df["shap_value"].values, alpha=0.8)
+
+    for bar, value in zip(bars, plot_df["shap_value"].values):
+        if value >= 0:
+            bar.set_color("red")
+        else:
+            bar.set_color("green")
+
+    ax.axvline(0, color="black", linewidth=1)
+    ax.set_title("Các yếu tố đang làm dự báo tăng hoặc giảm")
+    ax.set_xlabel("Mức tác động đến dự báo (MW)")
+    ax.set_ylabel("Biến")
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+    return fig
+
+
+def generate_simple_global_shap_insights(shap_values, feature_names: list[str]) -> list[str]:
+    mean_abs = np.abs(shap_values.values).mean(axis=0)
+    ranking = pd.Series(mean_abs, index=feature_names).sort_values(ascending=False)
+
+    top_features = [human_feature_name(x) for x in ranking.head(3).index.tolist()]
+
+    return [
+        f"Ba biến quan trọng nhất của mô hình là: {', '.join(top_features)}.",
+        "Điều này cho thấy mô hình chủ yếu dựa vào lịch sử tiêu thụ gần nhất và đặc trưng thời gian để dự báo.",
+        "Phần giải thích bên dưới sẽ cho biết cụ thể ở từng thời điểm, biến nào làm giá trị dự báo tăng hoặc giảm.",
+    ]
+
+
+# ===================== ANOMALY DETECTION HELPERS =====================
+ANOMALY_VALUE_COL = "load_value"
+
+
+def build_anomaly_feature_frame(df_input: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    out = df_input.copy().sort_index()
+    out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
+    out = out.dropna(subset=[value_col])
+
+    idx = out.index
+    out["hour"] = idx.hour
+    out["dayofweek"] = idx.dayofweek
+    out["month"] = idx.month
+    out["is_weekend"] = (out["dayofweek"] >= 5).astype(int)
+
+    out["lag_1"] = out[value_col].shift(1)
+    out["lag_24"] = out[value_col].shift(24)
+    out["roll_mean_24"] = out[value_col].rolling(24, min_periods=1).mean()
+    out["roll_std_24"] = out[value_col].rolling(24, min_periods=1).std(ddof=0).fillna(0.0)
+    out["diff_from_roll_mean_24"] = out[value_col] - out["roll_mean_24"]
+
+    return out
+
+
+def fit_isolation_forest(history_df: pd.DataFrame, target_col: str):
+    train_source = history_df[[target_col]].copy().rename(columns={target_col: ANOMALY_VALUE_COL})
+    hist = build_anomaly_feature_frame(train_source, ANOMALY_VALUE_COL)
+    feature_cols = [
+        ANOMALY_VALUE_COL,
+        "hour",
+        "dayofweek",
+        "month",
+        "is_weekend",
+        "lag_1",
+        "lag_24",
+        "roll_mean_24",
+        "roll_std_24",
+        "diff_from_roll_mean_24",
+    ]
+    train_df = hist[feature_cols].dropna().copy()
+
+    if len(train_df) < 100:
+        raise ValueError("Chưa đủ dữ liệu lịch sử để huấn luyện Isolation Forest.")
+
+    model = IsolationForest(
+        n_estimators=200,
+        contamination=0.05,
+        random_state=42,
+    )
+    model.fit(train_df)
+    return model, feature_cols, hist
+
+
+def detect_forecast_anomalies(history_df: pd.DataFrame, forecast_df: pd.DataFrame, target_col: str):
+    model, feature_cols, hist = fit_isolation_forest(history_df, target_col)
+
+    history_series = history_df[target_col].dropna().astype(float).copy()
+    rows = []
+
+    for ts, pred in forecast_df[["Datetime", "yhat"]].itertuples(index=False, name=None):
+        ts = pd.Timestamp(ts)
+        series_for_ts = pd.concat([
+            history_series,
+            pd.Series([float(pred)], index=[ts])
+        ])
+        tmp = build_anomaly_feature_frame(
+            pd.DataFrame({ANOMALY_VALUE_COL: series_for_ts}),
+            ANOMALY_VALUE_COL,
+        )
+        row = tmp.loc[[ts]].copy()
+        rows.append(row)
+        history_series.loc[ts] = float(pred)
+
+    future_features = pd.concat(rows).sort_index()
+    X_future = future_features[feature_cols].copy().ffill().bfill().fillna(0.0)
+
+    preds = model.predict(X_future)
+    scores = model.decision_function(X_future)
+
+    result = forecast_df.copy()
+    result = result.sort_values("Datetime").reset_index(drop=True)
+    result["anomaly_flag"] = preds
+    result["anomaly_score"] = scores
+    result["is_anomaly"] = result["anomaly_flag"] == -1
+
+    hourly_stats = hist.groupby("hour")[ANOMALY_VALUE_COL].agg(["mean", "std"]).reset_index()
+    hourly_stats.columns = ["hour", "hour_mean", "hour_std"]
+    hourly_stats["hour_std"] = hourly_stats["hour_std"].fillna(1.0).replace(0, 1.0)
+
+    result = result.merge(hourly_stats, on="hour", how="left")
+    result["hour_zscore"] = (result["yhat"] - result["hour_mean"]) / result["hour_std"]
+
+    return result
+
+
+def generate_anomaly_insights(anomaly_df: pd.DataFrame) -> list[str]:
+    flagged = anomaly_df[anomaly_df["is_anomaly"]].copy()
+
+    if flagged.empty:
+        return [
+            "Không phát hiện điểm bất thường rõ rệt trong giai đoạn dự báo.",
+            "Các giá trị dự báo nhìn chung vẫn nằm trong vùng hành vi quen thuộc của dữ liệu lịch sử."
+        ]
+
+    top = flagged.nsmallest(3, "anomaly_score")
+    insights = [
+        f"Phát hiện {len(flagged)} điểm dự báo có dấu hiệu bất thường cần theo dõi."
+    ]
+
+    for _, row in top.iterrows():
+        direction = "cao hơn" if row["hour_zscore"] >= 0 else "thấp hơn"
+        insights.append(
+            f"Tại {row['Datetime']}, phụ tải dự báo {row['yhat']:,.2f} MW, {direction} mức thông thường của cùng khung giờ khoảng {abs(row['hour_zscore']):,.2f} độ lệch chuẩn."
+        )
+
+    return insights
+
+
+def plot_anomaly_chart(forecast_with_anomaly: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    ax.plot(
+        forecast_with_anomaly["Datetime"],
+        forecast_with_anomaly["yhat"],
+        linewidth=1.8,
+        label="Forecast"
+    )
+
+    flagged = forecast_with_anomaly[forecast_with_anomaly["is_anomaly"]]
+    if not flagged.empty:
+        ax.scatter(
+            flagged["Datetime"],
+            flagged["yhat"],
+            s=60,
+            color="red",
+            label="Anomaly"
+        )
+
+    ax.set_title("Forecast with Anomaly Warnings")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("MW")
+    ax.grid(axis="y", linestyle="--", alpha=0.35)
+    ax.legend()
+    return fig
+
 
 # ===================== SIDEBAR =====================
 st.sidebar.header("SETTING")
 st.sidebar.caption("Upload file data")
 
 uploaded = st.sidebar.file_uploader("Upload file CSV", type=["csv"])
-
 show_raw = st.sidebar.toggle("Show raw data (head)", value=False)
 show_fc_table = st.sidebar.toggle("Show forecast table", value=True)
-save_name = st.sidebar.text_input("Eport file name", value="forecast_result.csv")
+save_name = st.sidebar.text_input("Export file name", value="forecast_result.csv")
 
-# Style options
 bar_label_mode = "Trong cột"
-#bar_label_mode = st.sidebar.selectbox("Chế độ nhãn cột", options=["Trong cột", "outside"], index=0)
 
-
-
-
-
-#===================== LOAD DATA =====================
+# ===================== LOAD DATA =====================
 df = None
-save_path = None
 current_raw_path = None
 
-# Load file mặc định: KHÔNG preprocess
-default_file = r"D:\ĐACN\Electricity_forecasting\data\sample\PJME_hourly.csv"
-if os.path.exists(default_file):
-    current_raw_path = default_file
-    raw_default_df = pd.read_csv(default_file)
+if DEFAULT_FILE.exists():
+    current_raw_path = DEFAULT_FILE
+    raw_default_df = pd.read_csv(DEFAULT_FILE)
 
     raw_default_df[TIME_COL] = pd.to_datetime(raw_default_df[TIME_COL], errors="coerce")
-    raw_default_df = raw_default_df.dropna(subset=[TIME_COL])
-    raw_default_df = raw_default_df.sort_values(TIME_COL)
+    raw_default_df = raw_default_df.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
 
     df = raw_default_df.set_index(TIME_COL).copy()
-    st.sidebar.success(f"✓ Default file loaded: {default_file}")
+    st.sidebar.success(f"✓ Default file loaded: {DEFAULT_FILE}")
 
-# Upload file khác sẽ ghi đè
 if uploaded:
-    raw_path = os.path.join("uploads", "raw", uploaded.name)
-    os.makedirs(os.path.dirname(raw_path), exist_ok=True)
+    raw_path = UPLOAD_RAW_DIR / uploaded.name
 
     with open(raw_path, "wb") as f:
         f.write(uploaded.getbuffer())
 
     current_raw_path = raw_path
+    df = preprocess_csv(str(raw_path), TIME_COL, TARGET_COL)
 
-    # Chỉ file upload mới preprocess
-    df = preprocess_csv(raw_path, TIME_COL, TARGET_COL)
-
-    if df is not None:
-        processed_path = os.path.join("uploads", "processed", uploaded.name)
-        os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+    if df is not None and not df.empty:
+        processed_path = UPLOAD_PROCESSED_DIR / uploaded.name
         df.to_csv(processed_path)
         st.sidebar.success(f"✓ Uploaded file processed: {uploaded.name}")
     else:
@@ -83,7 +551,8 @@ if uploaded:
 # ===================== TABS =====================
 tab_eda, tab_forecast = st.tabs(["📊 EDA", "🔮 Forecast"])
 
-# ===================== TAB EDA (để sẵn, làm sau) =====================
+
+# ===================== TAB EDA =====================
 with tab_eda:
     st.subheader("Exploratory Data Analysis (EDA)")
 
@@ -95,10 +564,8 @@ with tab_eda:
         st.warning("Raw file not found.")
         st.stop()
 
+    df_analysis = add_analysis_features(df, TARGET_COL)
     raw_df = pd.read_csv(current_raw_path)
-
-    st.write("Raw rows:", len(raw_df))
-    st.write("Rows used in analysis:", len(df))
 
     raw_df[TIME_COL] = pd.to_datetime(raw_df[TIME_COL], errors="coerce")
     raw_df = raw_df.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
@@ -109,67 +576,50 @@ with tab_eda:
         freq="H"
     )
 
-    st.write("Expected hourly rows:", len(full_range))
-    st.write("Missing timestamps:", len(full_range) - len(raw_df))
-    st.write("Duplicated timestamps:", raw_df[TIME_COL].duplicated().sum())
+    info1, info2, info3, info4 = st.columns(4)
+    info1.metric("Raw Rows", f"{len(raw_df):,}")
+    info2.metric("Rows Used", f"{len(df_analysis):,}")
+    info3.metric("Missing Timestamps", f"{len(full_range) - len(raw_df):,}")
+    info4.metric("Duplicated Timestamps", f"{raw_df[TIME_COL].duplicated().sum():,}")
 
-    st.markdown("### Basic information about the dataset")
-    st.markdown(f"""
-    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-        <tr>
-            <td style="padding: 10px; text-align: center;"><strong>Number of Rows</strong><br>{len(df):,}</td>
-            <td style="padding: 10px; text-align: center;"><strong>Start</strong><br>{str(df.index.min())}</td>
-            <td style="padding: 10px; text-align: center;"><strong>End</strong><br>{str(df.index.max())}</td>
-            <td style="padding: 10px; text-align: center;"><strong>Target Column</strong><br>{TARGET_COL}</td>
-        </tr>
-    </table>
-    """, unsafe_allow_html=True)
+    st.markdown("### Basic Information")
+    meta1, meta2, meta3 = st.columns(3)
+    meta1.metric("Start", str(df_analysis.index.min()))
+    meta2.metric("End", str(df_analysis.index.max()))
+    meta3.metric("Target", TARGET_COL)
 
     if show_raw:
         with st.expander("Show raw data (first 30 rows)", expanded=False):
             st.dataframe(raw_df.head(30), use_container_width=True)
 
-#==============================================================================
-
-
+    # ===== TREND =====
     st.markdown("### Electricity Consumption Trend")
-
-    fig, ax = plt.subplots(figsize=(14,4))
-    ax.plot(df.index, df[TARGET_COL])
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(df_analysis.index, df_analysis[TARGET_COL], linewidth=0.9)
     ax.set_title("Electricity Consumption Over Time")
     ax.set_xlabel("Time")
     ax.set_ylabel("MW")
     ax.grid(alpha=0.3)
     st.pyplot(fig, use_container_width=True)
-    st.caption("This chart shows the electricity consumption trend over time")
+    plt.close(fig)
 
+    show_ai_insight("Auto Insight for Trend Chart", generate_trend_insights(df_analysis[TARGET_COL]))
 
-
-
+    # ===== HOURLY =====
     st.markdown("### Average Electricity Load by Hour")
+    hourly_mean = df_analysis.groupby("hour")[TARGET_COL].mean()
 
-    # Tạo features thời gian
-    df_analysis = df.copy()
-    df_analysis["hour"] = df_analysis.index.hour
-    df_analysis["dayofweek"] = df_analysis.index.dayofweek
-    df_analysis["month"] = df_analysis.index.month
-    df_analysis["day_name"] = df_analysis.index.day_name()
-
-    hourly = df_analysis.groupby("hour")[TARGET_COL].mean()
-
-    # Metrics
-    peak_hour = hourly.idxmax()
-    peak_value = hourly.max()
-    low_hour = hourly.idxmin()
-    low_value = hourly.min()
+    peak_hour = int(hourly_mean.idxmax())
+    peak_value = float(hourly_mean.max())
+    low_hour = int(hourly_mean.idxmin())
+    low_value = float(hourly_mean.min())
 
     hcol1, hcol2 = st.columns(2)
     hcol1.metric("⬆️ Peak Hour", f"{peak_hour}:00", f"{peak_value:,.2f} MW")
     hcol2.metric("⬇️ Low Hour", f"{low_hour}:00", f"{low_value:,.2f} MW")
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    bars = ax.bar(hourly.index, hourly.values, color="steelblue", alpha=0.7)
-    # Tô màu cho giờ cao điểm và thấp điểm
+    bars = ax.bar(hourly_mean.index, hourly_mean.values, alpha=0.75)
     bars[peak_hour].set_color("red")
     bars[low_hour].set_color("green")
     ax.set_xlabel("Hour of day")
@@ -178,18 +628,11 @@ with tab_eda:
     ax.set_xticks(range(24))
     ax.grid(axis="y", alpha=0.3)
     st.pyplot(fig, use_container_width=True)
-    
-    st.caption(f"""
-    **Insight:** Electricity consumption varies significantly throughout the day. 
-                The peak hour occurs at **{peak_hour}:00 with {peak_value:,.2f} MW**, 
-                while the lowest demand occurs at **{low_hour}:00 with {low_value:,.2f} MW**.
-                """)
+    plt.close(fig)
 
+    show_ai_insight("Auto Insight for Hourly Chart", generate_hourly_insights(hourly_mean))
 
-
-
-
-# =========================Lượng tiêu thụ điện theo giờ trong ngày cụ thể=========================
+    # ===== DAILY =====
     st.markdown("### Analysis of Electricity Consumption by Day")
     min_date = df_analysis.index.min().date()
     max_date = df_analysis.index.max().date()
@@ -201,211 +644,161 @@ with tab_eda:
         max_value=max_date
     )
 
-    # Lọc dữ liệu của ngày được chọn
-    selected_date_data = df_analysis[df_analysis.index.date == selected_date].copy()
+    selected_day_df = df_analysis[df_analysis.index.date == selected_date].copy()
+    full_day = pd.date_range(start=pd.Timestamp(selected_date), periods=24, freq="h")
+    selected_day_df = selected_day_df.reindex(full_day)
+    selected_day_df["hour"] = selected_day_df.index.hour
 
-    # Tạo đủ 24 giờ từ 0 đến 23h
-    full_day = pd.date_range(
-        start=pd.Timestamp(selected_date),
-        periods=24,
-        freq="h"
-    )
-
-    selected_date_data = selected_date_data.reindex(full_day)
-    selected_date_data["hour"] = selected_date_data.index.hour
-
-    if not selected_date_data[TARGET_COL].dropna().empty:
-        # Tính các chỉ số trong ngày
-        avg_day = selected_date_data[TARGET_COL].mean(skipna=True)
-        max_day_val = selected_date_data[TARGET_COL].max(skipna=True)
-        min_day_val = selected_date_data[TARGET_COL].min(skipna=True)
+    if not selected_day_df[TARGET_COL].dropna().empty:
+        valid = selected_day_df[TARGET_COL].dropna()
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Average Daily Load", f"{avg_day:,.2f} MW")
-        col2.metric("Maximum Daily Load", f"{max_day_val:,.2f} MW")
-        col3.metric("Minimum Daily Load", f"{min_day_val:,.2f} MW")
+        col1.metric("Average Daily Load", f"{valid.mean():,.2f} MW")
+        col2.metric("Maximum Daily Load", f"{valid.max():,.2f} MW")
+        col3.metric("Minimum Daily Load", f"{valid.min():,.2f} MW")
 
-        # Tìm giờ cao nhất
-        peak_data = selected_date_data[TARGET_COL].dropna()
-        peak_time = peak_data.idxmax()
-        peak_hour = peak_time.hour
-        peak_value = peak_data.max()
-
-        # Vẽ biểu đồ giống mẫu
         fig, ax = plt.subplots(figsize=(10, 4.5))
-        ax.plot(
-            selected_date_data["hour"],
-            selected_date_data[TARGET_COL],
-            marker="o",
-            linewidth=2
-        )
-
+        ax.plot(selected_day_df["hour"], selected_day_df[TARGET_COL], marker="o", linewidth=2)
         ax.set_title(f"Electricity Consumption by Hour on {selected_date}")
         ax.set_xlabel("Hour")
         ax.set_ylabel("MW")
         ax.set_xticks(range(24))
         ax.grid(True, axis="y", linestyle="--", alpha=0.5)
-
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
 
-        # Nhận xét
-        st.markdown("### Insight")
-        st.write(
-            f"On **{selected_date}**, the highest electricity consumption occurs at "
-            f"**{peak_hour}:00** with a value of approximately **{peak_value:,.2f} MW**."
+        show_ai_insight(
+            "Auto Insight for Daily Chart",
+            generate_selected_day_insights(selected_day_df, TARGET_COL, selected_date)
         )
-
     else:
         st.warning(f"No data available for {selected_date}")
 
-
-
-
+    # ===== MONTHLY =====
     st.markdown("### Analysis of Electricity Consumption by Month")
 
-    # Tạo features thời gian
-    df_analysis = df.copy()
-    df_analysis["hour"] = df_analysis.index.hour
-    df_analysis["dayofweek"] = df_analysis.index.dayofweek
-    df_analysis["month"] = df_analysis.index.month
-    df_analysis["year"] = df_analysis.index.year
-    df_analysis["day_name"] = df_analysis.index.day_name()
+    monthly_year = (
+        df_analysis.groupby(["year", "month"])[TARGET_COL]
+        .mean()
+        .reset_index()
+    )
 
-    # Tính trung bình theo năm và tháng
-    monthly_year = df_analysis.groupby(["year", "month"])[TARGET_COL].mean().reset_index()
+    monthly_mean = df_analysis.groupby("month")[TARGET_COL].mean().reindex(range(1, 13))
 
-    # Tìm tháng cao nhất và thấp nhất (theo năm)
     max_row = monthly_year.loc[monthly_year[TARGET_COL].idxmax()]
     min_row = monthly_year.loc[monthly_year[TARGET_COL].idxmin()]
 
     mcol1, mcol2 = st.columns(2)
-    mcol1.metric("🔥 The highest month", f"Month {int(max_row['month'])} {int(max_row['year'])}", f"{max_row[TARGET_COL]:,.2f} MW")
-    mcol2.metric("❄️ The lowest month", f"Month {int(min_row['month'])} {int(min_row['year'])}", f"{min_row[TARGET_COL]:,.2f} MW")
-
-    # Vẽ biểu đồ trung bình theo tháng (không phân biệt năm)
-    monthly = df_analysis.groupby("month")[TARGET_COL].mean()
+    mcol1.metric(
+        "🔥 The Highest Month",
+        f"Month {int(max_row['month'])}/{int(max_row['year'])}",
+        f"{max_row[TARGET_COL]:,.2f} MW"
+    )
+    mcol2.metric(
+        "❄️ The Lowest Month",
+        f"Month {int(min_row['month'])}/{int(min_row['year'])}",
+        f"{min_row[TARGET_COL]:,.2f} MW"
+    )
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    bars = ax.bar(monthly.index, monthly.values, color="steelblue", alpha=0.7)
-    # Tô màu cho tháng cao nhất và thấp nhất (dựa trên trung bình tổng)
-    bars[int(max_row['month']) - 1].set_color("red")
-    bars[int(min_row['month']) - 1].set_color("green")
+    bars = ax.bar(monthly_mean.index, monthly_mean.values, alpha=0.75)
+    bars[int(monthly_mean.idxmax()) - 1].set_color("red")
+    bars[int(monthly_mean.idxmin()) - 1].set_color("green")
     ax.set_xlabel("Month")
     ax.set_ylabel("MW")
     ax.set_title("Average Electricity Load by Month")
     ax.set_xticks(range(1, 13))
     ax.grid(axis="y", alpha=0.3)
     st.pyplot(fig, use_container_width=True)
-    
-    st.caption(f"""
-    **Insight:** **Month {int(max_row['month'])} {int(max_row['year'])}** has the highest consumption ({max_row[TARGET_COL]:,.2f} MW), 
-                while **Month {int(min_row['month'])} {int(min_row['year'])}** has the lowest ({min_row[TARGET_COL]:,.2f} MW). 
-                This difference reflects the clear seasonal pattern, influenced by weather conditions and actual demand.
-                """)
+    plt.close(fig)
 
+    show_ai_insight("Auto Insight for Monthly Chart", generate_monthly_insights(monthly_year, TARGET_COL))
 
-
-
+    # ===== SEASON =====
     st.markdown("### Analysis of Electricity Consumption by Season")
-    
-    # Thêm biến mùa
-    def get_season(month):
-        if month in [3, 4, 5]:
-            return "Spring"
-        elif month in [6, 7, 8]:
-            return "Summer"
-        elif month in [9, 10, 11]:
-            return "Autumn"
-        else:
-            return "Winter"
-    
-    df_analysis["season"] = df_analysis["month"].apply(get_season)
 
-    # Thêm biến ngày lễ Việt Nam (chỉ dựa trên tháng/ngày, không phụ thuộc năm)
-    def is_vn_holiday(row):
-        month = row["month"]
-        day = row.name.day  # Lấy ngày từ index datetime
-        
-        # Danh sách ngày lễ VN (tháng-ngày)
-        vn_holidays_list = [
-            (1, 1),    # Tết dương lịch
-            (1, 30), (2, 1),  # Tết âm lịch (gần đúng, 30 Tết - 2 Tết)
-            (4, 30),   # 30/4 - Ngày Giải phóng
-            (5, 1),    # 1/5 - Quốc tế lao động
-            (9, 2),    # 2/9 - Quốc khánh
-        ]
-        
-        return (month, day) in vn_holidays_list
-    
-    df_analysis["is_holiday"] = df_analysis.apply(is_vn_holiday, axis=1)
-    df_analysis["day_type"] = df_analysis.apply(
-        lambda row: "Holiday" if row["is_holiday"] else ("Weekday" if row["dayofweek"] < 5 else "Weekend"),
+    season_month = (
+        df_analysis.groupby(["season", "month"])[TARGET_COL]
+        .mean()
+        .reset_index()
+    )
+
+    season_month["season"] = pd.Categorical(
+        season_month["season"],
+        categories=SEASON_ORDER,
+        ordered=True
+    )
+    season_month = season_month.sort_values(["month", "season"])
+    season_month["label"] = season_month.apply(
+        lambda row: f"{row['season']}\n(M{int(row['month'])})",
         axis=1
     )
-    
-    # ===== Tiêu thụ theo mùa x tháng =====
-    season_month = df_analysis.groupby(["season", "month"])[TARGET_COL].mean().reset_index()
-    season_month = season_month.sort_values("month")
-    season_month["label"] = season_month.apply(
-        lambda row: f"{row['season']}\n(Tháng {int(row['month'])})", axis=1
-    )
-    
-    fig_sm, ax_sm = plt.subplots(figsize=(12, 4))
-    colors = {"Spring": "green", "Summer": "red", "Autumn": "orange", "Winter": "blue"}
-    bar_colors = [colors[s] for s in season_month["season"]]
-    ax_sm.bar(range(len(season_month)), season_month[TARGET_COL].values, color=bar_colors, alpha=0.7)
-    ax_sm.set_xticks(range(len(season_month)))
-    ax_sm.set_xticklabels(season_month["label"], fontsize=9)
-    ax_sm.set_ylabel("MW")
-    ax_sm.set_title("Analysis of Electricity Consumption by Season and Month")
-    ax_sm.grid(axis="y", alpha=0.3)
-    st.pyplot(fig_sm, use_container_width=True)
-    
-    st.caption("""
-    **Insight:** The grouped chart of seasons and months helps to see the clear trend of electricity consumption in each season. 
-    Each column represents a month, colored according to the season (Spring-green, Summer-red, Autumn-orange, Winter-blue).
-    """)
 
-    # ===== Tiêu thụ theo ngày lễ x tháng =====
-    st.markdown("### Analysis of Electricity Consumption by Holiday and Month")
-    
-    holiday_month = df_analysis.groupby(["is_holiday", "month"])[TARGET_COL].mean().reset_index()
-    holiday_month["day_type_label"] = holiday_month["is_holiday"].map({True: "Holiday", False: "Weekday"})
-    holiday_month = holiday_month.sort_values("month")
-    
-    # Pivot để so sánh side-by-side
-    pivot_hm = holiday_month.pivot_table(
+    fig, ax = plt.subplots(figsize=(12, 4))
+    bar_colors = season_month["season"].map({
+        "Spring": "green",
+        "Summer": "red",
+        "Autumn": "orange",
+        "Winter": "blue"
+    })
+    ax.bar(range(len(season_month)), season_month[TARGET_COL].values, color=bar_colors, alpha=0.75)
+    ax.set_xticks(range(len(season_month)))
+    ax.set_xticklabels(season_month["label"], fontsize=9)
+    ax.set_ylabel("MW")
+    ax.set_title("Analysis of Electricity Consumption by Season and Month")
+    ax.grid(axis="y", alpha=0.3)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    show_ai_insight("Auto Insight for Seasonal Chart", generate_season_insights(season_month, TARGET_COL))
+
+    # ===== DAY TYPE =====
+    st.markdown("### Analysis of Electricity Consumption by Day Type")
+
+    day_type_month = (
+        df_analysis.groupby(["month", "day_type"])[TARGET_COL]
+        .mean()
+        .reset_index()
+    )
+
+    pivot_day_type = day_type_month.pivot_table(
         values=TARGET_COL,
         index="month",
-        columns="day_type_label",
+        columns="day_type",
         aggfunc="mean"
-    )
-    
-    fig_hm, ax_hm = plt.subplots(figsize=(12, 4))
-    x = range(len(pivot_hm))
-    width = 0.35
-    
-    ax_hm.bar([i - width/2 for i in x], pivot_hm["Weekday"].values, width, label="Weekday", color="steelblue", alpha=0.7)
-    ax_hm.bar([i + width/2 for i in x], pivot_hm["Holiday"].values, width, label="Holiday", color="coral", alpha=0.7)
-    
-    ax_hm.set_xlabel("Month")
-    ax_hm.set_ylabel("MW")
-    ax_hm.set_title("Comparison of Electricity Consumption: Weekday vs Holiday by Month")
-    ax_hm.set_xticks(x)
-    ax_hm.set_xticklabels(pivot_hm.index)
-    ax_hm.legend()
-    ax_hm.grid(axis="y", alpha=0.3)
-    st.pyplot(fig_hm, use_container_width=True)
-    
-    st.caption("""
-    **Insight:** The comparison chart of electricity consumption between weekdays (blue) and holidays (coral) by month. 
-    Overall, holidays have lower consumption than weekdays due to reduced economic and production activities.
-    """)
+    ).reindex(range(1, 13))
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    x = np.arange(len(pivot_day_type.index))
+    width = 0.25
+
+    if "Weekday" in pivot_day_type.columns:
+        ax.bar(x - width, pivot_day_type["Weekday"].values, width, label="Weekday", alpha=0.75)
+    if "Weekend" in pivot_day_type.columns:
+        ax.bar(x, pivot_day_type["Weekend"].values, width, label="Weekend", alpha=0.75)
+    if "Holiday" in pivot_day_type.columns:
+        ax.bar(x + width, pivot_day_type["Holiday"].values, width, label="Holiday", alpha=0.75)
+
+    ax.set_xlabel("Month")
+    ax.set_ylabel("MW")
+    ax.set_title("Comparison of Electricity Consumption by Day Type")
+    ax.set_xticks(x)
+    ax.set_xticklabels(pivot_day_type.index)
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    day_type_mean = df_analysis.groupby("day_type")[TARGET_COL].mean()
+    show_ai_insight("Auto Insight for Day-Type Chart", generate_day_type_insights(day_type_mean))
 
 
-# ===================== TAB FORECAST (làm chính) =====================
+# ===================== TAB FORECAST =====================
 with tab_forecast:
+    if df is None:
+        st.warning("Choose a file.")
+        st.stop()
+
     st.subheader("Base information about the dataset")
     st.markdown(f"""
     <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
@@ -417,51 +810,72 @@ with tab_forecast:
         </tr>
     </table>           
     """, unsafe_allow_html=True)
-
     st.markdown("### Select Forecasting Time Range")
 
-    # Default: dự báo từ giờ tiếp theo
     min_date = (df.index.max() + pd.Timedelta(hours=1)).date()
+    source_signature = f"{len(df)}|{df.index.min()}|{df.index.max()}"
 
-    fcol1, fcol2, fcol3 = st.columns([1, 1, 1])
-    start_date = fcol1.date_input("Start date", value=min_date)
-    end_date = fcol2.date_input("End date", value=min_date)
+    if st.session_state.forecast_source_signature != source_signature:
+        st.session_state.forecast_result = None
+        st.session_state.forecast_start_date = None
+        st.session_state.forecast_end_date = None
+        st.session_state.forecast_source_signature = source_signature
+        st.session_state.selected_forecast_idx = 0
 
-    # Validate input
+    with st.form("forecast_form"):
+        fcol1, fcol2 = st.columns(2)
+        start_date = fcol1.date_input(
+            "Start date",
+            value=st.session_state.forecast_start_date or min_date,
+            key="forecast_start_input",
+        )
+        end_date = fcol2.date_input(
+            "End date",
+            value=st.session_state.forecast_end_date or min_date,
+            key="forecast_end_input",
+        )
+        submitted = st.form_submit_button("Forecast", type="primary")
+
     if end_date < start_date:
         st.error("End date must be greater than or equal to Start date.")
         st.stop()
 
-    btn_col1, btn_col2 = st.columns([1, 5])
-    run = btn_col1.button("Forecast", type="primary")
+    if submitted:
+        with st.spinner("Running forecast..."):
+            fc = forecast_by_date(
+                df=df,
+                time_col=TIME_COL,
+                target_col=TARGET_COL,
+                start_date=str(start_date),
+                end_date=str(end_date),
+                model_path=MODEL_PATH,
+                feature_config_path=CFG_PATH,
+            )
 
-    if not run:
+        if fc is None or len(fc) == 0:
+            st.error("No forecast results available. Please check the date range or the forecast function.")
+            st.stop()
+
+        st.session_state.forecast_result = fc.copy()
+        st.session_state.forecast_start_date = start_date
+        st.session_state.forecast_end_date = end_date
+        st.session_state.selected_forecast_idx = 0
+
+    if st.session_state.forecast_result is None:
         st.caption("Press Forecast to run the forecast.")
         st.stop()
 
-    # ===================== FORECAST =====================
-    with st.spinner("Running forecast..."):
-        fc, X_future, feature_names  = forecast_by_date(
-            df=df,
-            time_col=TIME_COL,
-            target_col=TARGET_COL,
-            start_date=str(start_date),
-            end_date=str(end_date),
-            model_path=MODEL_PATH,
-            feature_config_path=CFG_PATH,
-        )
+    fc = st.session_state.forecast_result.copy()
 
-    if fc is None or len(fc) == 0:
-        st.error("No forecast results available. Please check the date range or the forecast_by_date() function.")
-        st.stop()
+    st.caption(
+        f"Đang hiển thị kết quả dự báo từ {st.session_state.forecast_start_date} đến {st.session_state.forecast_end_date}."
+    )
 
-    # Normalize columns
     fc["Datetime"] = pd.to_datetime(fc["Datetime"])
     fc = fc.sort_values("Datetime")
     fc["date"] = fc["Datetime"].dt.date
     fc["hour"] = fc["Datetime"].dt.hour
 
-    # ===================== SUMMARY METRICS =====================
     avg_value = float(fc["yhat"].mean())
     max_point = fc.loc[fc["yhat"].idxmax()]
     min_point = fc.loc[fc["yhat"].idxmin()]
@@ -470,33 +884,154 @@ with tab_forecast:
     m1.metric("Average Value", f"{avg_value:,.2f} MW")
     m2.metric("Highest Peak", f"{max_point['yhat']:,.2f} MW", str(max_point["Datetime"]))
     m3.metric("Lowest Point", f"{min_point['yhat']:,.2f} MW", str(min_point["Datetime"]))
-    m4.metric("Number of Forecast Points", f"{len(fc):,}")
-
-
-
-
-
+    m4.metric("Forecast Points", f"{len(fc):,}")
 
     st.markdown("### Line Chart of Forecast")
-    # Line chart (matplotlib for nicer control)
     fig_line = px.line(
         fc,
         x="Datetime",
         y="yhat",
         title="Predicted Electricity Load Over Time",
-        labels={"Datetime": "Thời gian", "yhat": "MW"},
-        hover_data={"Datetime": "|%Y-%m-%d %H:%M", "yhat": ":,.2f"}  # Tùy chỉnh format hover
+        labels={"Datetime": "Time", "yhat": "MW"},
+        hover_data={"Datetime": "|%Y-%m-%d %H:%M", "yhat": ":,.2f"}
     )
     fig_line.update_layout(
         xaxis_title="Time",
         yaxis_title="MW",
-        hovermode="x unified"  # Hover trên toàn bộ x-axis
+        hovermode="x unified"
     )
     st.plotly_chart(fig_line, use_container_width=True)
 
+    show_ai_insight("Auto Insight for Forecast Chart", generate_forecast_insights(fc))
 
+    st.markdown("### Giải thích dự báo bằng SHAP")
+    st.caption("Phần này cho biết vì sao mô hình dự báo tăng hoặc giảm tại một thời điểm cụ thể.")
 
-    # ===================== ANALYSIS =====================
+    try:
+        model, feature_names = load_model_and_feature_names(MODEL_PATH, CFG_PATH)
+
+        _, X_future = build_forecast_feature_matrix(
+            history_df=df,
+            forecast_df=fc,
+            target_col=TARGET_COL,
+            feature_names=feature_names,
+        )
+
+        explainer = make_shap_explainer(model, X_future)
+        shap_values = explainer(X_future)
+
+        show_ai_insight(
+            "Giải thích tổng quát của mô hình",
+            generate_simple_global_shap_insights(shap_values, feature_names)
+        )
+
+        st.markdown("#### Chọn thời điểm cần giải thích")
+        max_idx = len(fc) - 1
+        if st.session_state.selected_forecast_idx > max_idx:
+            st.session_state.selected_forecast_idx = 0
+
+        selected_idx = st.slider(
+            "Điểm dự báo",
+            min_value=0,
+            max_value=max_idx,
+            key="selected_forecast_idx"
+        )
+
+        selected_time = fc.iloc[selected_idx]["Datetime"]
+        selected_pred = float(fc.iloc[selected_idx]["yhat"])
+
+        base_value, positive_df, negative_df, top_abs, summary_text = explain_single_prediction_simple(
+            shap_row=shap_values[selected_idx],
+            feature_row=X_future.iloc[selected_idx],
+            pred_value=selected_pred,
+        )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Thời điểm", str(selected_time))
+        c2.metric("Giá trị gốc của mô hình", f"{base_value:,.2f} MW")
+        c3.metric("Dự báo cuối cùng", f"{selected_pred:,.2f} MW")
+
+        st.markdown("#### Cách hiểu nhanh")
+        st.info(summary_text)
+
+        chart_fig = plot_simple_shap_contributions(top_abs)
+        st.pyplot(chart_fig, use_container_width=True)
+        plt.close(chart_fig)
+
+        left_col, right_col = st.columns(2)
+
+        with left_col:
+            st.markdown("#### 3 yếu tố làm dự báo tăng")
+            if positive_df.empty:
+                st.write("Không có yếu tố tăng rõ rệt.")
+            else:
+                increase_table = positive_df[["feature_name", "feature_value", "shap_value"]].copy()
+                increase_table.columns = ["Yếu tố", "Giá trị", "Tác động tăng (MW)"]
+                increase_table["Tác động tăng (MW)"] = increase_table["Tác động tăng (MW)"].map(lambda x: f"{x:,.2f}")
+                st.dataframe(increase_table, use_container_width=True, hide_index=True)
+
+        with right_col:
+            st.markdown("#### 3 yếu tố làm dự báo giảm")
+            if negative_df.empty:
+                st.write("Không có yếu tố giảm rõ rệt.")
+            else:
+                decrease_table = negative_df[["feature_name", "feature_value", "shap_value"]].copy()
+                decrease_table.columns = ["Yếu tố", "Giá trị", "Tác động giảm (MW)"]
+                decrease_table["Tác động giảm (MW)"] = decrease_table["Tác động giảm (MW)"].map(lambda x: f"{x:,.2f}")
+                st.dataframe(decrease_table, use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.warning(f"Không thể tạo phần giải thích SHAP: {e}")
+
+    st.markdown("### Cảnh báo bất thường bằng Isolation Forest")
+    st.caption("Các điểm bị đánh dấu là những giờ dự báo có hành vi khác đáng kể so với lịch sử quen thuộc.")
+
+    try:
+        anomaly_df = detect_forecast_anomalies(
+            history_df=df,
+            forecast_df=fc,
+            target_col=TARGET_COL,
+        )
+
+        show_ai_insight(
+            "Tóm tắt cảnh báo bất thường",
+            generate_anomaly_insights(anomaly_df)
+        )
+
+        fig_anomaly = plot_anomaly_chart(anomaly_df)
+        st.pyplot(fig_anomaly, use_container_width=True)
+        plt.close(fig_anomaly)
+
+        flagged = anomaly_df[anomaly_df["is_anomaly"]].copy()
+        flagged = flagged.sort_values(["anomaly_score", "Datetime"]).reset_index(drop=True)
+
+        st.markdown("#### Danh sách điểm cảnh báo")
+        if flagged.empty:
+            st.success("Không có điểm forecast bất thường trong giai đoạn đã chọn.")
+        else:
+            alert_table = flagged[[
+                "Datetime",
+                "yhat",
+                "anomaly_score",
+                "hour_mean",
+                "hour_zscore",
+            ]].copy()
+            alert_table.columns = [
+                "Thời điểm",
+                "Dự báo (MW)",
+                "Điểm bất thường",
+                "Trung bình cùng giờ (MW)",
+                "Z-score cùng giờ",
+            ]
+            alert_table["Dự báo (MW)"] = alert_table["Dự báo (MW)"].map(lambda x: f"{x:,.2f}")
+            alert_table["Điểm bất thường"] = alert_table["Điểm bất thường"].map(lambda x: f"{x:,.4f}")
+            alert_table["Trung bình cùng giờ (MW)"] = alert_table["Trung bình cùng giờ (MW)"].map(lambda x: f"{x:,.2f}")
+            alert_table["Z-score cùng giờ"] = alert_table["Z-score cùng giờ"].map(lambda x: f"{x:,.2f}")
+            st.dataframe(alert_table, use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.warning(f"Không thể chạy Isolation Forest: {e}")
+
     st.markdown("### Quick Analysis")
 
     daily = fc.groupby("date")["yhat"].mean()
@@ -507,44 +1042,41 @@ with tab_forecast:
     max_hour = int(hourly.idxmax())
     min_hour = int(hourly.idxmin())
 
-    # Peak hour by day
     peak_hour_by_day = (
         fc.loc[fc.groupby("date")["yhat"].idxmax(), ["date", "hour"]]
         .set_index("date")["hour"]
     )
 
     left, right = st.columns([1.2, 1])
+
     with left:
         st.write("**Summary Insights**")
         st.write(
             f"""
-            - Highest forecast day: {max_day} (Average: {daily.max():,.2f} MW)
-            - Lowest forecast day: {min_day} (Average: {daily.min():,.2f} MW)
-            - Highest peak hour: {max_hour}:00 (Average: {hourly.max():,.2f} MW)
-            - Lowest peak hour: {min_hour}:00 (Average: {hourly.min():,.2f} MW)
-        """
+- Highest forecast day: {max_day} (Average: {daily.max():,.2f} MW)
+- Lowest forecast day: {min_day} (Average: {daily.min():,.2f} MW)
+- Highest peak hour: {max_hour}:00 (Average: {hourly.max():,.2f} MW)
+- Lowest peak hour: {min_hour}:00 (Average: {hourly.min():,.2f} MW)
+"""
         )
 
     with right:
         st.write("**Hourly Average Distribution**")
         fig_h, ax_h = plt.subplots(figsize=(8, 3.2))
-        ax_h.plot(hourly.index, hourly.values, marker="o")
+        ax_h.plot(hourly.index, hourly.values, marker="o", linewidth=1.8)
         ax_h.set_xlabel("Hour")
         ax_h.set_ylabel("MW")
-        ax_h.set_title("Average yhat by Hour")
+        ax_h.set_title("Average Predicted Load by Hour")
         ax_h.grid(axis="y", linestyle="--", alpha=0.35)
         ax_h.set_xticks(list(range(0, 24, 2)))
         st.pyplot(fig_h, use_container_width=True)
+        plt.close(fig_h)
 
-
-
-
-    # ===================== DAILY BAR CHART =====================
     st.markdown("### Daily Average Forecast Comparison")
 
-    fig_bar, ax = plt.subplots(figsize=(14, 5.0))
+    fig_bar, ax = plt.subplots(figsize=(14, 5))
     x_labels = daily.index.astype(str)
-    bars = ax.bar(x_labels, daily.values)
+    bars = ax.bar(x_labels, daily.values, alpha=0.78)
 
     ax.axhline(avg_value, linestyle="--", linewidth=2, label="Average Value")
     ax.grid(axis="y", linestyle="--", alpha=0.35)
@@ -554,10 +1086,8 @@ with tab_forecast:
     ax.set_ylim(0, daily.max() * 1.25)
     plt.xticks(rotation=30)
 
-    # Labels
     for i, d in enumerate(daily.index):
         peak_h = int(peak_hour_by_day.loc[d])
-
         if bar_label_mode == "Trong cột":
             y_pos = daily.values[i] * 0.15
             ax.text(
@@ -569,24 +1099,19 @@ with tab_forecast:
                 fontweight="bold",
                 color="white",
             )
-        
-
-    if bar_label_mode == "Dưới cột":
-        # chừa khoảng dưới để không bị cắt chữ
-        fig_bar.subplots_adjust(bottom=0.22)
 
     ax.legend()
     st.pyplot(fig_bar, use_container_width=True)
+    plt.close(fig_bar)
 
-    # ===================== TABLE + DOWNLOAD =====================
     st.markdown("### Forecast Results")
 
     if show_fc_table:
         st.dataframe(fc[["Datetime", "yhat"]].reset_index(drop=True), use_container_width=True)
 
-    out_path = os.path.join("outputs", "forecasts", save_name)
+    out_path = os.path.join(ROOT_DIR, "outputs", "forecasts", save_name)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     fc.to_csv(out_path, index=False)
-    st.success(f"Đã lưu file: {out_path}")
 
     st.download_button(
         f"Tải file {save_name}",

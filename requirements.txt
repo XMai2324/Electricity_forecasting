@@ -1,0 +1,7 @@
+# Thư viện cần thiết cho dự án
+pip install pandas numpy xgboost shap streamlit scikit-learn matplotlib plotly joblib
+pip install -r requirements.txt
+
+
+# Chạy dự án
+streamlit run dashboard.py

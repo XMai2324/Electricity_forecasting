@@ -38,55 +38,45 @@ def forecast_by_date(
     cfg = load_feature_config(feature_config_path)
     feature_names = cfg.get("features") or cfg.get("feature_names")
     if not feature_names:
-        raise ValueError("feature_config.json thiếu key features (hoặc feature_names).")
+        raise ValueError("feature_config.json thiếu key features hoặc feature_names.")
 
     model = load_model(model_path)
 
     if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("df phải có index là DatetimeIndex (đã set_index cột thời gian).")
+        raise ValueError("df phải có index là DatetimeIndex.")
 
     df = df.sort_index()
     last_ts = df.index.max()
 
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
+
     if end_ts < start_ts:
         raise ValueError("end_date phải lớn hơn hoặc bằng start_date.")
 
-    # Nếu user chọn start_date trước hoặc bằng dữ liệu lịch sử, ta vẫn dự báo từ max(last_ts, start_ts)
-    run_start = max(last_ts, start_ts)
-
     freq = cfg.get("frequency_hint") or _infer_freq(df.index)
 
-    # tạo future index, bắt đầu sau last_ts 1 bước
     first_future = last_ts + pd.tseries.frequencies.to_offset(freq)
-    future_index = pd.date_range(start=first_future, end=end_ts, freq=freq)
+    actual_start = max(first_future, start_ts)
 
-    # Nếu user chọn end_date <= last_ts thì không có tương lai để dự báo
+    future_index = pd.date_range(start=actual_start, end=end_ts, freq=freq)
+
     if len(future_index) == 0:
         return pd.DataFrame(columns=["Datetime", "yhat"])
 
-    # Lịch sử để tạo lag/rolling
     history = df[target_col].astype(float).copy()
 
     preds = []
     for ts in future_index:
         row_dict = build_feature_row(ts, history, feature_names)
         X_one = pd.DataFrame([row_dict], columns=feature_names)
-
-        # Nếu vẫn còn NaN do thiếu lịch sử, fill theo cách an toàn
-        X_one = X_one.fillna(method="ffill", axis=1).fillna(0)
+        X_one = X_one.ffill(axis=1).fillna(0)
 
         yhat = float(model.predict(X_one)[0])
         preds.append((ts, yhat))
 
-        # cập nhật history để bước sau có lag/rolling
         history = pd.concat([history, pd.Series([yhat], index=[ts])])
 
     out = pd.DataFrame(preds, columns=["Datetime", "yhat"])
-
-    # lọc theo khoảng user muốn (start_date -> end_date)
-    out = out[out["Datetime"] >= start_ts]
-    out = out[out["Datetime"] <= end_ts]
     out = out.reset_index(drop=True)
     return out

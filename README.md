@@ -1,8 +1,16 @@
 # Electricity_forecasting
 
-Project này phân tích dữ liệu tiêu thụ điện trong quá khứ 2002-2018, train mô hình dự đoán tiêu thụ trong tương lai(giờ, ngày)
+Hệ Thống Phân Tích và Dự Báo Phụ Tải Điện (XGBoost & SHAP)
+Hệ thống này được phát triển để dự báo nhu cầu tiêu thụ điện năng dựa trên dữ liệu lịch sử, đồng thời cung cấp khả năng giải thích các quyết định của mô hình AI và phát hiện các điểm dữ liệu bất thường.
 
+🌟 Tính năng chính
+Dự báo chuỗi thời gian (Time-series Forecasting): Sử dụng thuật toán XGBoost để dự báo lượng điện tiêu thụ (PJME_MW) trong tương lai dựa trên các đặc trưng thời gian và độ trễ (lags).
 
+Giải thích mô hình (Explainable AI - XAI): Tích hợp thuật toán SHAP (TreeExplainer) để minh bạch hóa lý do tại sao mô hình đưa ra con số dự báo cụ thể, giúp người dùng hiểu rõ tác động của từng biến như nhiệt độ, giờ cao điểm, hay ngày lễ.
+
+Phát hiện bất thường (Anomaly Detection): Sử dụng thuật toán Isolation Forest để cảnh báo các điểm dự báo có dấu hiệu bất thường (quá cao hoặc quá thấp) so với quy luật tiêu thụ thông thường trong quá khứ.
+
+Dashboard tương tác: Giao diện web được xây dựng bằng Streamlit, cho phép người dùng upload dữ liệu, xem biểu đồ phân tích (EDA) và thực hiện dự báo trực quan.
 
 
 
@@ -18,7 +26,7 @@ electricity_forecast_system/
 │
 ├─ data/
 │  ├─ sample/                        # file mẫu để người dùng upload thử
-│  └─ reference/                     # file phụ trợ: holiday, mapping cột (nếu có)
+│  └─ reference/       (chưa có)              # file phụ trợ: holiday, mapping cột (nếu có)
 │
 ├─ uploads/
 │  ├─ raw/                           # file người dùng vừa upload (giữ nguyên)
@@ -32,17 +40,17 @@ electricity_forecast_system/
 │  ├─ preprocess.py                  # đọc file upload, parse datetime, xử lý thiếu, sort
 │  ├─ features.py                    # tạo lag, rolling, time features
 │  ├─ forecast.py                    # dự báo theo ngày tùy chọn (start_date, end_date)
-│  ├─ evaluate.py                    # tính MAE, RMSE, MAPE (khi có ground truth)
+│  ├─ evaluate.py  (chưa có)                   # tính MAE, RMSE, MAPE (khi có ground truth)
 │  └─ io_utils.py                    # save/load csv, json, model, helper paths
 │
 ├─ app/
-│  ├─ api.py                         # FastAPI: upload file + forecast theo ngày
+│  ├─ api.py      (chưa có)                    # FastAPI: upload file + forecast theo ngày
 │  └─ dashboard.py                   # Streamlit: upload + chọn ngày + xem bảng/biểu đồ
 │
 └─ outputs/
    ├─ forecasts/                     # kết quả dự báo (csv) theo từng lần chạy
-   ├─ reports/                       # metrics, log tóm tắt (json/csv)
-   └─ figures/                       # biểu đồ xuất ra để đưa vào báo cáo
+   ├─ reports/    (chưa có)                   # metrics, log tóm tắt (json/csv)
+   └─ figures/    (chưa có)                    # biểu đồ xuất ra để đưa vào báo cáo
 
 
 
