@@ -370,7 +370,7 @@ def generate_simple_global_shap_insights(shap_values, feature_names: list[str]) 
 # ===================== ANOMALY DETECTION HELPERS =====================
 ANOMALY_VALUE_COL = "load_value"
 
-
+#Tạo đặc trưng cho mô hình Isolation Forest, bao gồm các đặc trưng thời gian và các đặc trưng trễ, trung bình trượt để giúp mô hình học được các mẫu bất thường trong dữ liệu dự báo
 def build_anomaly_feature_frame(df_input: pd.DataFrame, value_col: str) -> pd.DataFrame:
     out = df_input.copy().sort_index()
     out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
@@ -410,11 +410,12 @@ def fit_isolation_forest(history_df: pd.DataFrame, target_col: str):
 
     if len(train_df) < 100:
         raise ValueError("Chưa đủ dữ liệu lịch sử để huấn luyện Isolation Forest.")
-
+    
+#Khỏi tạo mô hình Isolation Forest của thư viện sklearn để phát hiện điểm bất thường trong dữ liệu dự báo
     model = IsolationForest(
-        n_estimators=200,
-        contamination=0.05,
-        random_state=42,
+        n_estimators=200,           #Số cây trong rừng
+        contamination=0.05,         #Tỷ lệ điểm bất thường dự kiến trong dữ liệu (có thể điều chỉnh nếu cần)
+        random_state=42,            #Đặt random_state để đảm bảo kết quả có thể tái lập
     )
     model.fit(train_df)
     return model, feature_cols, hist
@@ -443,8 +444,8 @@ def detect_forecast_anomalies(history_df: pd.DataFrame, forecast_df: pd.DataFram
     future_features = pd.concat(rows).sort_index()
     X_future = future_features[feature_cols].copy().ffill().bfill().fillna(0.0)
 
-    preds = model.predict(X_future)
-    scores = model.decision_function(X_future)
+    preds = model.predict(X_future)                # Hàm thư viện sklearn: 1 = bình thường, -1 = bất thường
+    scores = model.decision_function(X_future)     # Hàm thư viện sklearn: điểm càng thấp càng bất thường
 
     result = forecast_df.copy()
     result = result.sort_values("Datetime").reset_index(drop=True)
@@ -857,123 +858,164 @@ with tab_eda:
     else:
         st.warning(f"No data available for {selected_date}")
 
-    # ===== MONTHLY =====
+        # ===== MONTHLY =====
     st.markdown("### Analysis of Electricity Consumption by Month")
 
-    monthly_year = (
-        df_analysis.groupby(["year", "month"])[TARGET_COL]
+    available_years = sorted(df_analysis["year"].dropna().unique().tolist())
+    selected_year = st.selectbox(
+        "Select year to analyze by month",
+        options=available_years,
+        index=len(available_years) - 1
+    )
+
+    df_year = df_analysis[df_analysis["year"] == selected_year].copy()
+
+    monthly_mean = (
+        df_year.groupby("month")[TARGET_COL]
         .mean()
-        .reset_index()
+        .reindex(range(1, 13))
     )
 
-    monthly_mean = df_analysis.groupby("month")[TARGET_COL].mean().reindex(range(1, 13))
+    valid_monthly = monthly_mean.dropna()
 
-    max_row = monthly_year.loc[monthly_year[TARGET_COL].idxmax()]
-    min_row = monthly_year.loc[monthly_year[TARGET_COL].idxmin()]
+    if not valid_monthly.empty:
+        max_month = int(valid_monthly.idxmax())
+        min_month = int(valid_monthly.idxmin())
+        max_value = float(valid_monthly.max())
+        min_value = float(valid_monthly.min())
 
-    mcol1, mcol2 = st.columns(2)
-    mcol1.metric(
-        "🔥 The Highest Month",
-        f"Month {int(max_row['month'])}/{int(max_row['year'])}",
-        f"{max_row[TARGET_COL]:,.2f} MW"
-    )
-    mcol2.metric(
-        "❄️ The Lowest Month",
-        f"Month {int(min_row['month'])}/{int(min_row['year'])}",
-        f"{min_row[TARGET_COL]:,.2f} MW"
-    )
+        mcol1, mcol2 = st.columns(2)
+        mcol1.metric(
+            "🔥 The Highest Month",
+            f"Month {max_month}/{selected_year}",
+            f"{max_value:,.2f} MW"
+        )
+        mcol2.metric(
+            "❄️ The Lowest Month",
+            f"Month {min_month}/{selected_year}",
+            f"{min_value:,.2f} MW"
+        )
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-    bars = ax.bar(monthly_mean.index, monthly_mean.values, alpha=0.75)
-    bars[int(monthly_mean.idxmax()) - 1].set_color("red")
-    bars[int(monthly_mean.idxmin()) - 1].set_color("green")
-    ax.set_xlabel("Month")
-    ax.set_ylabel("MW")
-    ax.set_title("Average Electricity Load by Month")
-    ax.set_xticks(range(1, 13))
-    ax.grid(axis="y", alpha=0.3)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+        fig, ax = plt.subplots(figsize=(12, 4))
+        bars = ax.bar(monthly_mean.index, monthly_mean.values, alpha=0.75)
 
-    show_ai_insight("Auto Insight for Monthly Chart", generate_monthly_insights(monthly_year, TARGET_COL))
+        if not np.isnan(monthly_mean.loc[max_month]):
+            bars[max_month - 1].set_color("red")
+        if not np.isnan(monthly_mean.loc[min_month]):
+            bars[min_month - 1].set_color("green")
+
+        ax.set_xlabel("Month")
+        ax.set_ylabel("MW")
+        ax.set_title(f"Average Electricity Load by Month in {selected_year}")
+        ax.set_xticks(range(1, 13))
+        ax.grid(axis="y", alpha=0.3)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+        monthly_year_df = df_year.groupby(["year", "month"])[TARGET_COL].mean().reset_index()
+        show_ai_insight(
+            "Auto Insight for Monthly Chart",
+            generate_monthly_insights(monthly_year_df, TARGET_COL)
+        )
+    else:
+        st.warning(f"No monthly data available for year {selected_year}.")
 
     # ===== SEASON =====
     st.markdown("### Analysis of Electricity Consumption by Season")
 
-    season_month = (
-        df_analysis.groupby(["season", "month"])[TARGET_COL]
+    def generate_selected_season_insights(season_month_daytype_df: pd.DataFrame, target_col: str, selected_season: str) -> list[str]:
+            if season_month_daytype_df.empty:
+                return [f"Chưa đủ dữ liệu để phân tích mùa {selected_season}."]
+
+            max_row = season_month_daytype_df.loc[season_month_daytype_df[target_col].idxmax()]
+            min_row = season_month_daytype_df.loc[season_month_daytype_df[target_col].idxmin()]
+
+            insights = [
+                f"Trong mùa {selected_season}, mức tiêu thụ cao nhất nằm ở tháng {int(max_row['month'])} thuộc nhóm {max_row['day_type']} với khoảng {max_row[target_col]:,.2f} MW.",
+                f"Trong mùa {selected_season}, mức tiêu thụ thấp nhất nằm ở tháng {int(min_row['month'])} thuộc nhóm {min_row['day_type']} với khoảng {min_row[target_col]:,.2f} MW.",
+                "Biểu đồ cho thấy trong cùng một mùa, mức tiêu thụ điện vẫn thay đổi theo từng tháng và từng loại ngày.",
+            ]
+
+            return insights
+    
+
+    season_month_map = {
+        "Spring": [3, 4, 5],
+        "Summer": [6, 7, 8],
+        "Autumn": [9, 10, 11],
+        "Winter": [12, 1, 2],
+    }
+
+    selected_season = st.selectbox(
+        "Select season to analyze",
+        options=SEASON_ORDER,
+        index=1
+    )
+
+    selected_months = season_month_map[selected_season]
+
+    season_month_daytype = (
+        df_analysis[
+            (df_analysis["season"] == selected_season)
+            & (df_analysis["month"].isin(selected_months))
+        ]
+        .groupby(["month", "day_type"])[TARGET_COL]
         .mean()
         .reset_index()
     )
 
-    season_month["season"] = pd.Categorical(
-        season_month["season"],
-        categories=SEASON_ORDER,
-        ordered=True
-    )
-    season_month = season_month.sort_values(["month", "season"])
-    season_month["label"] = season_month.apply(
-        lambda row: f"{row['season']}\n(M{int(row['month'])})",
-        axis=1
-    )
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    bar_colors = season_month["season"].map({
-        "Spring": "green",
-        "Summer": "red",
-        "Autumn": "orange",
-        "Winter": "blue"
-    })
-    ax.bar(range(len(season_month)), season_month[TARGET_COL].values, color=bar_colors, alpha=0.75)
-    ax.set_xticks(range(len(season_month)))
-    ax.set_xticklabels(season_month["label"], fontsize=9)
-    ax.set_ylabel("MW")
-    ax.set_title("Analysis of Electricity Consumption by Season and Month")
-    ax.grid(axis="y", alpha=0.3)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-    show_ai_insight("Auto Insight for Seasonal Chart", generate_season_insights(season_month, TARGET_COL))
-
-    # ===== DAY TYPE =====
-    st.markdown("### Analysis of Electricity Consumption by Day Type")
-
-    day_type_month = (
-        df_analysis.groupby(["month", "day_type"])[TARGET_COL]
-        .mean()
-        .reset_index()
-    )
-
-    pivot_day_type = day_type_month.pivot_table(
+    pivot_season = season_month_daytype.pivot_table(
         values=TARGET_COL,
         index="month",
         columns="day_type",
         aggfunc="mean"
-    ).reindex(range(1, 13))
+    ).reindex(selected_months)
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-    x = np.arange(len(pivot_day_type.index))
-    width = 0.25
+    valid_values = season_month_daytype[TARGET_COL].dropna()
 
-    if "Weekday" in pivot_day_type.columns:
-        ax.bar(x - width, pivot_day_type["Weekday"].values, width, label="Weekday", alpha=0.75)
-    if "Weekend" in pivot_day_type.columns:
-        ax.bar(x, pivot_day_type["Weekend"].values, width, label="Weekend", alpha=0.75)
-    if "Holiday" in pivot_day_type.columns:
-        ax.bar(x + width, pivot_day_type["Holiday"].values, width, label="Holiday", alpha=0.75)
+    if not valid_values.empty:
+        max_row = season_month_daytype.loc[season_month_daytype[TARGET_COL].idxmax()]
+        min_row = season_month_daytype.loc[season_month_daytype[TARGET_COL].idxmin()]
 
-    ax.set_xlabel("Month")
-    ax.set_ylabel("MW")
-    ax.set_title("Comparison of Electricity Consumption by Day Type")
-    ax.set_xticks(x)
-    ax.set_xticklabels(pivot_day_type.index)
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+        scol1, scol2 = st.columns(2)
+        scol1.metric(
+            "🔥 Highest in Selected Season",
+            f"Month {int(max_row['month'])} - {max_row['day_type']}",
+            f"{max_row[TARGET_COL]:,.2f} MW"
+        )
+        scol2.metric(
+            "❄️ Lowest in Selected Season",
+            f"Month {int(min_row['month'])} - {min_row['day_type']}",
+            f"{min_row[TARGET_COL]:,.2f} MW"
+        )
 
-    day_type_mean = df_analysis.groupby("day_type")[TARGET_COL].mean()
-    show_ai_insight("Auto Insight for Day-Type Chart", generate_day_type_insights(day_type_mean))
+        fig, ax = plt.subplots(figsize=(12, 4.5))
+        x = np.arange(len(selected_months))
+        width = 0.25
+
+        if "Weekday" in pivot_season.columns:
+            ax.bar(x - width, pivot_season["Weekday"].values, width, label="Weekday", alpha=0.75)
+        if "Weekend" in pivot_season.columns:
+            ax.bar(x, pivot_season["Weekend"].values, width, label="Weekend", alpha=0.75)
+        if "Holiday" in pivot_season.columns:
+            ax.bar(x + width, pivot_season["Holiday"].values, width, label="Holiday", alpha=0.75)
+
+        ax.set_xlabel("Month")
+        ax.set_ylabel("MW")
+        ax.set_title(f"Electricity Consumption by Month and Day Type in {selected_season}")
+        ax.set_xticks(x)
+        ax.set_xticklabels(selected_months)
+        ax.legend()
+        ax.grid(axis="y", alpha=0.3)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+        show_ai_insight(
+            "Auto Insight for Selected Season Chart",
+            generate_selected_season_insights(season_month_daytype, TARGET_COL, selected_season)
+        )
+    else:
+        st.warning(f"No data available for season {selected_season}.")
 
 
 # ===================== TAB FORECAST =====================
@@ -1087,6 +1129,8 @@ with tab_forecast:
 
     show_ai_insight("Auto Insight for Forecast Chart", generate_forecast_insights(fc))
 
+
+
     st.markdown("### Giải thích dự báo bằng SHAP")
     st.caption("Phần này cho biết vì sao mô hình dự báo tăng hoặc giảm tại một thời điểm cụ thể.")
 
@@ -1165,6 +1209,9 @@ with tab_forecast:
 
     except Exception as e:
         st.warning(f"Không thể tạo phần giải thích SHAP: {e}")
+
+
+
 
     st.markdown("### Cảnh báo bất thường bằng Isolation Forest")
     st.caption("Các điểm bị đánh dấu là những giờ dự báo có hành vi khác đáng kể so với lịch sử quen thuộc.")
