@@ -1,5 +1,12 @@
 # Thư viện cần thiết cho dự án
-pip install pandas numpy xgboost shap streamlit scikit-learn matplotlib plotly joblib
+streamlit
+pandas
+numpy
+matplotlib
+plotly
+joblib
+scikit-learn
+xgboost
 pip install -r requirements.txt
 
 
