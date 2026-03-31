@@ -14,7 +14,11 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
-import shap
+
+try:
+    import shap
+except ImportError:
+    shap = None
 
 from sklearn.ensemble import IsolationForest
 
@@ -31,7 +35,6 @@ TARGET_COL = "PJME_MW"
 
 MODEL_PATH = ROOT_DIR / "artifacts" / "model.pkl"
 CFG_PATH = ROOT_DIR / "artifacts" / "feature_config.json"
-DEFAULT_FILE = ROOT_DIR / "data" / "sample" / "PJME_hourly.csv"
 
 UPLOAD_RAW_DIR = ROOT_DIR / "uploads" / "raw"
 UPLOAD_PROCESSED_DIR = ROOT_DIR / "uploads" / "processed"
@@ -201,7 +204,6 @@ def generate_forecast_insights(fc: pd.DataFrame) -> list[str]:
     return insights
 
 
-
 # ===================== SIMPLE SHAP HELPERS =====================
 FEATURE_LABELS = {
     "hour": "Giờ trong ngày",
@@ -276,6 +278,9 @@ def build_forecast_feature_matrix(history_df, forecast_df, target_col, feature_n
 
 
 def make_shap_explainer(model, X_background):
+    if shap is None:
+        raise ImportError("Chưa cài thư viện shap. Hãy chạy: pip install shap")
+
     try:
         return shap.TreeExplainer(model)
     except Exception:
@@ -451,6 +456,9 @@ def detect_forecast_anomalies(history_df: pd.DataFrame, forecast_df: pd.DataFram
     hourly_stats.columns = ["hour", "hour_mean", "hour_std"]
     hourly_stats["hour_std"] = hourly_stats["hour_std"].fillna(1.0).replace(0, 1.0)
 
+    if "hour" not in result.columns:
+        result["hour"] = pd.to_datetime(result["Datetime"]).dt.hour
+
     result = result.merge(hourly_stats, on="hour", how="left")
     result["hour_zscore"] = (result["yhat"] - result["hour_mean"]) / result["hour_std"]
 
@@ -506,15 +514,196 @@ def plot_anomaly_chart(forecast_with_anomaly: pd.DataFrame):
     ax.legend()
     return fig
 
+def render_welcome_screen():
+    st.markdown("""
+    <style>
+    .hero-box {
+        background: linear-gradient(135deg, #0f172a 0%, #132238 45%, #16304d 100%);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 22px;
+        padding: 28px 30px;
+        margin-bottom: 20px;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .hero-title {
+        font-size: 30px;
+        font-weight: 800;
+        color: #ffffff;
+        margin-bottom: 10px;
+        line-height: 1.2;
+    }
+
+    .hero-desc {
+        font-size: 16px;
+        color: #d7e3f4;
+        line-height: 1.7;
+        margin-bottom: 0;
+    }
+
+    .mini-card {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 18px;
+        padding: 18px 18px 16px 18px;
+        min-height: 150px;
+        box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+    }
+
+    .mini-card-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #ffffff;
+        margin-top: 8px;
+        margin-bottom: 8px;
+    }
+
+    .mini-card-desc {
+        font-size: 14px;
+        color: #cbd5e1;
+        line-height: 1.6;
+    }
+
+    .feature-box {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 18px;
+        padding: 22px;
+        height: 100%;
+    }
+
+    .feature-title {
+        font-size: 20px;
+        font-weight: 700;
+        color: #ffffff;
+        margin-bottom: 12px;
+    }
+
+    .feature-text {
+        font-size: 14px;
+        color: #d1d5db;
+        line-height: 1.7;
+    }
+
+    .note-box {
+        background: rgba(59,130,246,0.12);
+        border: 1px solid rgba(59,130,246,0.25);
+        border-radius: 16px;
+        padding: 16px 18px;
+        margin-top: 12px;
+        color: #dbeafe;
+        line-height: 1.7;
+        font-size: 14px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="hero-box">
+        <div class="hero-title">⚡ Chào mừng đến với hệ thống phân tích và dự báo điện năng</div>
+        <div class="hero-desc">
+            Hệ thống hỗ trợ tải dữ liệu điện năng từ file CSV, thực hiện phân tích khám phá dữ liệu,
+            trực quan hóa xu hướng tiêu thụ và dự báo nhu cầu điện bằng mô hình AI.
+            Hãy bắt đầu bằng cách tải file dữ liệu ở thanh bên trái.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("""
+        <div class="mini-card">
+            <div style="font-size:32px;">📊</div>
+            <div class="mini-card-title">Phân tích EDA</div>
+            <div class="mini-card-desc">
+                Khám phá xu hướng tiêu thụ điện theo giờ, ngày, tháng, mùa và loại ngày.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c2:
+        st.markdown("""
+        <div class="mini-card">
+            <div style="font-size:32px;">🔮</div>
+            <div class="mini-card-title">Dự báo nhu cầu</div>
+            <div class="mini-card-desc">
+                Dự đoán phụ tải điện trong tương lai theo khoảng ngày người dùng lựa chọn.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with c3:
+        st.markdown("""
+        <div class="mini-card">
+            <div style="font-size:32px;">🤖</div>
+            <div class="mini-card-title">Giải thích mô hình</div>
+            <div class="mini-card-desc">
+                Hỗ trợ giải thích kết quả dự báo và cảnh báo bất thường trong dữ liệu dự báo.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    left, right = st.columns([1.1, 0.9])
+
+    with left:
+        st.markdown("""
+        <div class="feature-box">
+            <div class="feature-title">📁 Định dạng file đầu vào</div>
+            <div class="feature-text">
+                File CSV nên có tối thiểu 2 cột chính:
+                <br><br>
+                <b>1. Datetime</b>: thời gian theo định dạng ngày giờ
+                <br>
+                <b>2. PJME_MW</b>: giá trị điện năng tiêu thụ
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        sample_df = pd.DataFrame({
+            "Datetime": ["2024-01-01 00:00:00", "2024-01-01 01:00:00", "2024-01-01 02:00:00"],
+            "PJME_MW": [24567.0, 23891.0, 23125.0]
+        })
+        st.markdown("#### CSV mẫu")
+        st.dataframe(sample_df, use_container_width=True, hide_index=True)
+
+    with right:
+        st.markdown("""
+        <div class="feature-box">
+            <div class="feature-title">🚀 Hệ thống hỗ trợ</div>
+            <div class="feature-text">
+                • Hiển thị tổng quan dữ liệu đầu vào<br>
+                • Phân tích mức tiêu thụ theo nhiều góc nhìn<br>
+                • Dự báo điện năng theo khoảng ngày<br>
+                • Giải thích dự báo bằng SHAP<br>
+                • Cảnh báo điểm bất thường bằng Isolation Forest
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="note-box">
+            <b>Gợi ý:</b> Sau khi upload file, hệ thống sẽ tự động làm sạch dữ liệu, xử lý cột thời gian
+            và hiển thị các biểu đồ phân tích trực quan ở hai tab EDA và Forecast.
+        </div>
+        """, unsafe_allow_html=True)
 
 # ===================== SIDEBAR =====================
 st.sidebar.header("SETTING")
 st.sidebar.caption("Upload file data")
 
 uploaded = st.sidebar.file_uploader("Upload file CSV", type=["csv"])
-show_raw = st.sidebar.toggle("Show raw data (head)", value=False)
-show_fc_table = st.sidebar.toggle("Show forecast table", value=True)
-save_name = st.sidebar.text_input("Export file name", value="forecast_result.csv")
+
+if uploaded is not None:
+    show_raw = st.sidebar.toggle("Show raw data (head)", value=False)
+    show_fc_table = st.sidebar.toggle("Show forecast table", value=True)
+    save_name = st.sidebar.text_input("Export file name", value="forecast_result.csv")
+else:
+    show_raw = False
+    show_fc_table = True
+    save_name = "forecast_result.csv"
 
 bar_label_mode = "Trong cột"
 
@@ -522,31 +711,25 @@ bar_label_mode = "Trong cột"
 df = None
 current_raw_path = None
 
-if DEFAULT_FILE.exists():
-    current_raw_path = DEFAULT_FILE
-    raw_default_df = pd.read_csv(DEFAULT_FILE)
+if uploaded is None:
+    render_welcome_screen()
+    st.stop()
 
-    raw_default_df[TIME_COL] = pd.to_datetime(raw_default_df[TIME_COL], errors="coerce")
-    raw_default_df = raw_default_df.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
+raw_path = UPLOAD_RAW_DIR / uploaded.name
 
-    df = raw_default_df.set_index(TIME_COL).copy()
-    st.sidebar.success(f"✓ Default file loaded: {DEFAULT_FILE}")
+with open(raw_path, "wb") as f:
+    f.write(uploaded.getbuffer())
 
-if uploaded:
-    raw_path = UPLOAD_RAW_DIR / uploaded.name
+current_raw_path = raw_path
+df = preprocess_csv(str(raw_path), TIME_COL, TARGET_COL)
 
-    with open(raw_path, "wb") as f:
-        f.write(uploaded.getbuffer())
-
-    current_raw_path = raw_path
-    df = preprocess_csv(str(raw_path), TIME_COL, TARGET_COL)
-
-    if df is not None and not df.empty:
-        processed_path = UPLOAD_PROCESSED_DIR / uploaded.name
-        df.to_csv(processed_path)
-        st.sidebar.success(f"✓ Uploaded file processed: {uploaded.name}")
-    else:
-        st.sidebar.error("File upload không hợp lệ hoặc không có dữ liệu. Vẫn dùng file mặc định.")
+if df is not None and not df.empty:
+    processed_path = UPLOAD_PROCESSED_DIR / uploaded.name
+    df.to_csv(processed_path)
+    st.sidebar.success(f"✓ Uploaded file processed: {uploaded.name}")
+else:
+    st.error("File upload không hợp lệ hoặc không có dữ liệu.")
+    st.stop()
 
 # ===================== TABS =====================
 tab_eda, tab_forecast = st.tabs(["📊 EDA", "🔮 Forecast"])
