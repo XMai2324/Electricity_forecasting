@@ -758,7 +758,7 @@ with tab_eda:
     full_range = pd.date_range(
         start=raw_df[TIME_COL].min(),
         end=raw_df[TIME_COL].max(),
-        freq="H"
+        freq="h"
     )
 
     info1, info2, info3, info4 = st.columns(4)
@@ -812,7 +812,8 @@ with tab_eda:
     ax.set_title("Phụ tải điện trung bình theo giờ")
     ax.set_xticks(range(24))
     ax.grid(axis="y", alpha=0.3)
-    st.pyplot(fig, use_container_width=True)
+    # st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, use_container_width='stretch')
     plt.close(fig)
 
     show_ai_insight("Nhận xét tự động cho biểu đồ theo giờ", generate_hourly_insights(hourly_mean))

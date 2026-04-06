@@ -38,8 +38,9 @@ def preprocess_csv(
     df = df.set_index(time_col)
 
     # Đảm bảo dữ liệu liên tục theo giờ (nếu thiếu giờ, thêm NaN rồi interpolate)
-    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq="H")
+    full_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq="h")
     df = df.reindex(full_range)
+    df.index.name = time_col
     df[target_col] = df[target_col].interpolate(method="time")
 
     # Loại bỏ NaN còn lại (nếu có)
