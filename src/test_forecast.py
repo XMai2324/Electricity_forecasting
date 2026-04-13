@@ -12,7 +12,8 @@ if __name__ == "__main__":
     TIME_COL = "Datetime"
     TARGET_COL = "PJME_MW"
 
-    df = preprocess_csv(csv_path, TIME_COL, TARGET_COL)
+    df, meta = preprocess_csv(csv_path, TIME_COL, TARGET_COL)
+    print(f"Preprocess metadata: {meta}")
 
     # chọn khoảng ngày muốn dự báo
     start_date = "2018-01-01"

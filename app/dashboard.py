@@ -304,7 +304,7 @@ def explain_single_prediction_simple(shap_row, feature_row, pred_value):
 
     top_abs = impacts.copy()
     top_abs["abs_value"] = top_abs["shap_value"].abs()
-    top_abs = top_abs.sort_values("abs_value", ascending=False).head(6)
+    top_abs = top_abs.sort_values("abs_value", ascending=False).head(6)  # 3 tăng + 3 giảm
 
     summary_parts = []
 
@@ -331,26 +331,31 @@ def explain_single_prediction_simple(shap_row, feature_row, pred_value):
     return base_value, positive_df, negative_df, top_abs, summary_text
 
 
-def plot_simple_shap_contributions(top_abs_df):
-    plot_df = top_abs_df.copy().sort_values("shap_value")
+def plot_shap_top_impacts(positive_df, negative_df):
+    """Vẽ biểu đồ gộp: 3 yếu tố tăng + 3 yếu tố giảm"""
+    plot_data = pd.concat([negative_df, positive_df]).sort_values("shap_value")
+    
+    if plot_data.empty:
+        return None
+    
     labels = [
         f"{row.feature_name}\n({row.feature_value})"
-        for _, row in plot_df.iterrows()
+        for _, row in plot_data.iterrows()
     ]
 
-    fig, ax = plt.subplots(figsize=(10, 4.8))
-    bars = ax.barh(labels, plot_df["shap_value"].values, alpha=0.8)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.barh(labels, plot_data["shap_value"].values, alpha=0.8)
 
-    for bar, value in zip(bars, plot_df["shap_value"].values):
+    for bar, value in zip(bars, plot_data["shap_value"].values):
         if value >= 0:
             bar.set_color("red")
         else:
             bar.set_color("green")
 
-    ax.axvline(0, color="black", linewidth=1)
-    ax.set_title("Các yếu tố đang làm dự báo tăng hoặc giảm")
-    ax.set_xlabel("Mức tác động đến dự báo (MW)")
-    ax.set_ylabel("Biến")
+    ax.axvline(0, color="black", linewidth=1.5)
+    ax.set_title("3 Yếu tố tăng và 3 Yếu tố giảm chính", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Mức tác động đến dự báo (MW)", fontsize=11)
+    ax.set_ylabel("Biến", fontsize=11)
     ax.grid(axis="x", linestyle="--", alpha=0.3)
 
     return fig
@@ -723,7 +728,14 @@ with open(raw_path, "wb") as f:
     f.write(uploaded.getbuffer())
 
 current_raw_path = raw_path
-df = preprocess_csv(str(raw_path), TIME_COL, TARGET_COL)
+result = preprocess_csv(str(raw_path), TIME_COL, TARGET_COL)
+
+# Handle both old (df only) and new (df, meta) return formats
+if isinstance(result, tuple):
+    df, preprocess_meta = result
+else:
+    df = result
+    preprocess_meta = None
 
 if df is not None and not df.empty:
     processed_path = UPLOAD_PROCESSED_DIR / uploaded.name
@@ -750,22 +762,20 @@ with tab_eda:
         st.stop()
 
     df_analysis = add_analysis_features(df, TARGET_COL)
-    raw_df = pd.read_csv(current_raw_path)
-
-    raw_df[TIME_COL] = pd.to_datetime(raw_df[TIME_COL], errors="coerce")
-    raw_df = raw_df.dropna(subset=[TIME_COL]).sort_values(TIME_COL)
-
-    full_range = pd.date_range(
-        start=raw_df[TIME_COL].min(),
-        end=raw_df[TIME_COL].max(),
-        freq="h"
-    )
 
     info1, info2, info3, info4 = st.columns(4)
-    info1.metric("Số dòng gốc", f"{len(raw_df):,}")
-    info2.metric("Số dòng sử dụng", f"{len(df_analysis):,}")
-    info3.metric("Mốc thời gian bị thiếu", f"{len(full_range) - len(raw_df):,}")
-    info4.metric("Mốc thời gian trùng lặp", f"{raw_df[TIME_COL].duplicated().sum():,}")
+    
+    if preprocess_meta is not None:
+        info1.metric("Số dòng gốc", f"{preprocess_meta['raw_lines']:,}")
+        info2.metric("Số dòng sử dụng", f"{preprocess_meta['final_lines']:,}")
+        info3.metric("Mốc thời gian bị thiếu", f"{preprocess_meta['missing_count']:,}")
+        info4.metric("Mốc thời gian trùng lặp", f"{preprocess_meta['dup_removed']:,}")
+    else:
+        # Fallback: tính từ df_analysis
+        info1.metric("Số dòng gốc", "N/A")
+        info2.metric("Số dòng sử dụng", f"{len(df_analysis):,}")
+        info3.metric("Mốc thời gian bị thiếu", "N/A")
+        info4.metric("Mốc thời gian trùng lặp", "N/A")
 
     st.markdown("### Thông tin cơ bản")
     meta1, meta2, meta3 = st.columns(3)
@@ -774,8 +784,8 @@ with tab_eda:
     meta3.metric("Cột mục tiêu", TARGET_COL)
 
     if show_raw:
-        with st.expander("Hiển thị dữ liệu gốc (30 dòng đầu)", expanded=False):
-            st.dataframe(raw_df.head(30), use_container_width=True)
+        with st.expander("Hiển thị dữ liệu xử lý (30 dòng đầu)", expanded=False):
+            st.dataframe(df.reset_index().head(30), use_container_width=True)
 
     # ===== TREND =====
     st.markdown("### Xu hướng tiêu thụ điện")
@@ -1184,14 +1194,16 @@ with tab_forecast:
         st.markdown("#### Cách hiểu nhanh")
         st.info(summary_text)
 
-        chart_fig = plot_simple_shap_contributions(top_abs)
-        st.pyplot(chart_fig, use_container_width=True)
-        plt.close(chart_fig)
+        # Vẽ biểu đồ gộp: 3 tăng + 3 giảm
+        chart_fig = plot_shap_top_impacts(positive_df, negative_df)
+        if chart_fig:
+            st.pyplot(chart_fig, use_container_width=True)
+            plt.close(chart_fig)
 
         left_col, right_col = st.columns(2)
 
         with left_col:
-            st.markdown("#### 3 yếu tố làm dự báo tăng")
+            st.markdown("#### Chi tiết 3 yếu tố làm tăng")
             if positive_df.empty:
                 st.write("Không có yếu tố làm tăng rõ rệt.")
             else:
@@ -1201,7 +1213,7 @@ with tab_forecast:
                 st.dataframe(increase_table, use_container_width=True, hide_index=True)
 
         with right_col:
-            st.markdown("#### 3 yếu tố làm dự báo giảm")
+            st.markdown("#### Chi tiết 3 yếu tố làm giảm")
             if negative_df.empty:
                 st.write("Không có yếu tố làm giảm rõ rệt.")
             else:
