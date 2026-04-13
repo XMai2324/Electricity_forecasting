@@ -353,7 +353,7 @@ def plot_shap_top_impacts(positive_df, negative_df):
             bar.set_color("green")
 
     ax.axvline(0, color="black", linewidth=1.5)
-    ax.set_title("3 Yếu tố tăng và 3 Yếu tố giảm chính", fontsize=14, fontweight="bold")
+    ax.set_title("3 Yếu tố ảnh hưởng chính", fontsize=14, fontweight="bold")
     ax.set_xlabel("Mức tác động đến dự báo (MW)", fontsize=11)
     ax.set_ylabel("Biến", fontsize=11)
     ax.grid(axis="x", linestyle="--", alpha=0.3)
